@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from .schemas import WakeRequest, matrix_to_nested
+from .schemas import JointTrialRequest, WakeRequest, matrix_to_nested
+from .joint import JointTrialResult, MutexGroup, joint_trial
 from .separation import (
     Capacity,
     ClosureConflict,
@@ -33,6 +34,7 @@ def _build_runway_flights(req: WakeRequest) -> dict[str, list[Flight]]:
                 scheduled_off=ensure_utc(f.scheduled_off),
                 wake=f.wake.value,
                 locked=f.locked,
+                runway=rw.runway,
             )
             for f in rw.flights
         ]
@@ -193,3 +195,59 @@ def run_best_adjacent_swap(req: WakeRequest) -> tuple[
 
 def nested_matrix(matrix: dict[tuple[str, str], int]) -> dict[str, dict[str, int]]:
     return matrix_to_nested(matrix)
+
+
+def _groups_from_request(req: JointTrialRequest) -> list[MutexGroup]:
+    if not req.groups:
+        return []
+    return [
+        MutexGroup(
+            name=group.name or f"group-{index}",
+            runways=tuple(group.runways),
+            min_interval_seconds=group.min_interval_seconds,
+        )
+        for index, group in enumerate(req.groups, start=1)
+    ]
+
+
+def run_joint_trial(req: JointTrialRequest) -> tuple[
+    dict[str, list[Flight]],
+    dict[tuple[str, str], int],
+    dict[str, list[ClosureWindow]],
+    dict[str, Capacity],
+    list[MutexGroup],
+    JointTrialResult,
+    set[str],
+    dict[str, list[str]],
+]:
+    """Build the global stable order and schedule all runways together.
+
+    Flights stay bound to their own runway's wake/closure/capacity rules;
+    mutex groups add cross-runway minimum intervals. Locked flights stop the
+    whole joint calculation at the first one that cannot keep schedule, and
+    the blocker carries every constraint's required earliest time.
+    """
+    payloads = _build_runway_flights(req)
+    windows = _build_runway_windows(req)
+    capacities = _build_runway_capacities(req)
+    matrix = _matrix_from_request(req)
+    groups = _groups_from_request(req)
+    result = joint_trial(
+        payloads,
+        groups=groups,
+        matrix=matrix,
+        windows_by_runway=windows,
+        capacities_by_runway=capacities,
+    )
+    locked_runways = _runways_with_locked_input(req)
+    locked_flights = _locked_flights_by_runway(payloads)
+    return (
+        payloads,
+        matrix,
+        windows,
+        capacities,
+        groups,
+        result,
+        locked_runways,
+        locked_flights,
+    )

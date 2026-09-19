@@ -7,6 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from .joint import JointBlocker, JointTrialItem, JointTrialResult, MutexGroup
 from .separation import (
     Capacity,
     CapacityViolation,
@@ -18,7 +19,7 @@ from .separation import (
     Violation,
     delay_stats,
 )
-from .timeutils import ensure_utc
+from .timeutils import ensure_utc, to_epoch_seconds
 
 
 def new_batch_id() -> str:
@@ -48,6 +49,8 @@ def save_batch(
     capacity_violations_by_runway: dict[str, list[CapacityViolation]] | None = None,
     trial_by_runway: dict[str, TrialRunwayResult] | None = None,
     swap_by_runway: dict[str, SwapRunwayResult] | None = None,
+    joint_groups: list[MutexGroup] | None = None,
+    joint_result: JointTrialResult | None = None,
     locked_runways: set[str] | None = None,
 ) -> str:
     batch_id = new_batch_id()
@@ -262,7 +265,174 @@ def save_batch(
             ),
         )
 
+    if joint_groups:
+        for index, group in enumerate(joint_groups, start=1):
+            conn.execute(
+                "INSERT INTO mutex_groups (batch_id, group_index, name,"
+                " runways_json, min_interval_seconds) VALUES (?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    index,
+                    group.name,
+                    json.dumps(list(group.runways)),
+                    group.min_interval_seconds,
+                ),
+            )
+
+    if joint_result is not None:
+        _save_joint_items(conn, batch_id, joint_result)
+
     return batch_id
+
+
+def _save_joint_items(
+    conn: sqlite3.Connection, batch_id: str, result: JointTrialResult
+) -> None:
+    """Persist the joint feasible prefix and (if any) the first blocker."""
+    for item in result.items:
+        conn.execute(
+            "INSERT INTO trial_items (batch_id, runway, position, runway_position,"
+            " flight_no, wake, scheduled_off, adjusted_off, delay_seconds,"
+            " constraint_type, triggered_by, closure_hit, closure_window_start,"
+            " closure_window_end, locked, capacity_hit, capacity_window_seconds,"
+            " capacity_max_departures, capacity_anchor, capacity_window_start,"
+            " capacity_window_end, mutex_group_hit, mutex_group_name,"
+            " mutex_group_anchor, mutex_group_min_interval_seconds,"
+            " mutex_group_window_start, mutex_group_window_end)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+            " ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                batch_id,
+                item.runway,
+                item.position,
+                _runway_position(result, item),
+                item.flight_no,
+                item.wake,
+                _iso(item.original_time),
+                _iso(item.adjusted_time),
+                item.delay_seconds,
+                item.constraint,
+                item.triggered_by,
+                int(item.closure_hit),
+                _iso(item.closure_window.start) if item.closure_window else None,
+                _iso(item.closure_window.end) if item.closure_window else None,
+                int(item.locked),
+                int(item.capacity_hit),
+                item.capacity_window_seconds,
+                item.capacity_max_departures,
+                item.capacity_anchor,
+                _iso(item.capacity_window_start)
+                if item.capacity_window_start
+                else None,
+                _iso(item.capacity_window_end) if item.capacity_window_end else None,
+                int(item.mutex_group_hit),
+                item.mutex_group_name,
+                item.mutex_group_anchor,
+                item.mutex_group_min_interval_seconds,
+                _iso(item.mutex_group_window_start)
+                if item.mutex_group_window_start
+                else None,
+                _iso(item.mutex_group_window_end)
+                if item.mutex_group_window_end
+                else None,
+            ),
+        )
+    blocked = result.blocked
+    if blocked is not None:
+        conn.execute(
+            "INSERT INTO trial_blockers (batch_id, runway, position, flight_no, wake,"
+            " scheduled_off, constraint_type, required_earliest_off, triggered_by,"
+            " required_gap_seconds, closure_hit, closure_window_start,"
+            " closure_window_end, capacity_hit, capacity_window_seconds,"
+            " capacity_max_departures, capacity_anchor, capacity_window_start,"
+            " capacity_window_end, mutex_group_hit, mutex_group_name,"
+            " mutex_group_anchor, mutex_group_min_interval_seconds,"
+            " mutex_group_window_start, mutex_group_window_end, required_times_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+            " ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                batch_id,
+                blocked.runway,
+                blocked.position,
+                blocked.flight_no,
+                blocked.wake,
+                _iso(blocked.scheduled_off),
+                blocked.constraint,
+                _iso(blocked.required_earliest_off),
+                blocked.triggered_by,
+                blocked.required_gap_seconds,
+                int(blocked.closure_hit),
+                _iso(blocked.closure_window.start) if blocked.closure_window else None,
+                _iso(blocked.closure_window.end) if blocked.closure_window else None,
+                int(blocked.capacity_hit),
+                blocked.capacity_window_seconds,
+                blocked.capacity_max_departures,
+                blocked.capacity_anchor,
+                _iso(blocked.capacity_window_start)
+                if blocked.capacity_window_start
+                else None,
+                _iso(blocked.capacity_window_end)
+                if blocked.capacity_window_end
+                else None,
+                int(blocked.mutex_group_hit),
+                blocked.mutex_group_name,
+                blocked.mutex_group_anchor,
+                blocked.mutex_group_min_interval_seconds,
+                _iso(blocked.mutex_group_window_start)
+                if blocked.mutex_group_window_start
+                else None,
+                _iso(blocked.mutex_group_window_end)
+                if blocked.mutex_group_window_end
+                else None,
+                _required_times_json(blocked),
+            ),
+        )
+
+
+def _runway_position(result: JointTrialResult, item: JointTrialItem) -> int:
+    """1-based stable position of ``item`` within its own runway."""
+    seen = 0
+    for runway, flight in result.order:
+        if runway == item.runway:
+            seen += 1
+            if flight.flight_no == item.flight_no:
+                return seen
+    return seen
+
+
+def _required_times_json(blocked: JointBlocker) -> str:
+    """Serialise every constraint's required time for the blocked flight."""
+
+    def payload(kind: str) -> dict | None:
+        data = blocked.required_times.get(kind)
+        if data is None:
+            return None
+        encoded = dict(data)
+        if "window" in data:
+            value = data["window"]
+            if isinstance(value, ClosureWindow):
+                encoded["window"] = {
+                    "start": _iso(value.start),
+                    "end": _iso(value.end),
+                }
+            else:
+                start_t, end_t = value
+                encoded["window"] = {
+                    "start": _iso(
+                        datetime.fromtimestamp(start_t, tz=timezone.utc)
+                    ),
+                    "end": _iso(datetime.fromtimestamp(end_t, tz=timezone.utc)),
+                }
+        if "required_off" in encoded:
+            encoded["required_off"] = _iso(encoded["required_off"])
+        return encoded
+
+    return json.dumps({kind: payload(kind) for kind in (
+        "wake",
+        "closure",
+        "capacity",
+        "mutex_group",
+    )})
 
 
 def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
@@ -434,6 +604,19 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
         if batch_has_locks:
             result["total_locked"] = sum(len(v) for v in locked_by_runway.values())
         return result
+
+    if row["mode"] == "joint_trial":
+        return _load_joint_batch(
+            conn=conn,
+            row=row,
+            batch_id=batch_id,
+            matrix=matrix,
+            flight_rows=flight_rows,
+            closures_by_runway=closures_by_runway,
+            capacities_by_runway=capacities_by_runway,
+            locked_by_runway=locked_by_runway,
+            batch_has_locks=batch_has_locks,
+        )
 
     # trial-style payloads: both "trial" and "best_adjacent_swap" persist
     # per-flight trial items (for the latter, in the optimised order).
@@ -611,3 +794,252 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
     if batch_has_locks:
         result["total_locked"] = sum(len(v) for v in locked_by_runway.values())
     return result
+
+
+def _load_joint_batch(
+    *,
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    batch_id: str,
+    matrix: dict[str, dict[str, int]],
+    flight_rows: list[sqlite3.Row],
+    closures_by_runway: dict[str, list[dict]],
+    capacities_by_runway: dict[str, dict],
+    locked_by_runway: dict[str, list[dict]],
+    batch_has_locks: bool,
+) -> dict:
+    """Reconstruct a joint_trial batch: global order, per-runway prefixes
+    and (if any) the first locked-flight blocker with per-constraint times."""
+    # Global stable order rebuilt from the stored plans using the same
+    # integer-second key as the engine: (scheduled epoch seconds, flight_no).
+    global_rows = sorted(
+        flight_rows,
+        key=lambda fr: (to_epoch_seconds(_dt(fr["scheduled_off"])), fr["flight_no"]),
+    )
+    order_by_runway: dict[str, list[str]] = {}
+    for fr in flight_rows:
+        order_by_runway.setdefault(fr["runway"], []).append(fr["flight_no"])
+
+    group_rows = conn.execute(
+        "SELECT group_index, name, runways_json, min_interval_seconds FROM mutex_groups"
+        " WHERE batch_id = ? ORDER BY group_index",
+        (batch_id,),
+    ).fetchall()
+    groups = [
+        {
+            "name": gr["name"],
+            "runways": json.loads(gr["runways_json"]),
+            "min_interval_seconds": gr["min_interval_seconds"],
+        }
+        for gr in group_rows
+    ]
+    group_of_runway = {
+        runway: group["name"] for group in groups for runway in group["runways"]
+    }
+
+    trows = conn.execute(
+        "SELECT * FROM trial_items WHERE batch_id = ? ORDER BY position",
+        (batch_id,),
+    ).fetchall()
+    items: list[dict] = []
+    for tr in trows:
+        closure_window = None
+        if tr["closure_window_start"] is not None:
+            closure_window = {
+                "start": _dt(tr["closure_window_start"]),
+                "end": _dt(tr["closure_window_end"]),
+            }
+        item = {
+            "position": tr["position"],
+            "runway_position": tr["runway_position"],
+            "runway": tr["runway"],
+            "flight_no": tr["flight_no"],
+            "wake": tr["wake"],
+            "scheduled_off": _dt(tr["scheduled_off"]),
+            "adjusted_off": _dt(tr["adjusted_off"]),
+            "delay_seconds": tr["delay_seconds"],
+            "constraint": tr["constraint_type"],
+            "triggered_by": tr["triggered_by"],
+            "closure_hit": bool(tr["closure_hit"]),
+            "closure_window": closure_window,
+        }
+        runway = tr["runway"]
+        if runway in capacities_by_runway:
+            capacity_window = None
+            if tr["capacity_window_start"] is not None:
+                capacity_window = {
+                    "start": _dt(tr["capacity_window_start"]),
+                    "end": _dt(tr["capacity_window_end"]),
+                }
+            item["capacity_hit"] = bool(tr["capacity_hit"])
+            item["capacity_window_seconds"] = tr["capacity_window_seconds"]
+            item["capacity_max_departures"] = tr["capacity_max_departures"]
+            item["capacity_anchor"] = tr["capacity_anchor"]
+            item["capacity_window"] = capacity_window
+        if runway in group_of_runway:
+            group_window = None
+            if tr["mutex_group_window_start"] is not None:
+                group_window = {
+                    "start": _dt(tr["mutex_group_window_start"]),
+                    "end": _dt(tr["mutex_group_window_end"]),
+                }
+            item["mutex_group_hit"] = bool(tr["mutex_group_hit"])
+            item["mutex_group"] = tr["mutex_group_name"]
+            item["mutex_group_anchor"] = tr["mutex_group_anchor"]
+            item["mutex_group_min_interval_seconds"] = tr[
+                "mutex_group_min_interval_seconds"
+            ]
+            item["mutex_group_window"] = group_window
+        if runway in locked_by_runway:
+            item["locked"] = bool(tr["locked"])
+        items.append(item)
+    items_by_runway: dict[str, list[dict]] = {}
+    for item in items:
+        items_by_runway.setdefault(item["runway"], []).append(item)
+
+    blocked_report: dict | None = None
+    brow = conn.execute(
+        "SELECT * FROM trial_blockers WHERE batch_id = ?", (batch_id,)
+    ).fetchone()
+    if brow is not None:
+        closure_window = None
+        if brow["closure_window_start"] is not None:
+            closure_window = {
+                "start": _dt(brow["closure_window_start"]),
+                "end": _dt(brow["closure_window_end"]),
+            }
+        # runway position: 1-based stable position of the blocker within its
+        # own runway's full planned order (later un-scheduled flights count).
+        runway_position = 0
+        for fr in global_rows:
+            if fr["runway"] == brow["runway"]:
+                runway_position += 1
+                if fr["flight_no"] == brow["flight_no"]:
+                    break
+        blocked_report = {
+            "position": brow["position"],
+            "runway_position": runway_position,
+            "runway": brow["runway"],
+            "flight_no": brow["flight_no"],
+            "wake": brow["wake"],
+            "scheduled_off": _dt(brow["scheduled_off"]),
+            "constraint": brow["constraint_type"],
+            "required_earliest_off": _dt(brow["required_earliest_off"]),
+            "triggered_by": brow["triggered_by"],
+            "required_gap_seconds": brow["required_gap_seconds"],
+            "closure_hit": bool(brow["closure_hit"]),
+            "closure_window": closure_window,
+            "required_times": _load_required_times(brow["required_times_json"]),
+        }
+        if brow["runway"] in capacities_by_runway:
+            capacity_window = None
+            if brow["capacity_window_start"] is not None:
+                capacity_window = {
+                    "start": _dt(brow["capacity_window_start"]),
+                    "end": _dt(brow["capacity_window_end"]),
+                }
+            blocked_report["capacity_hit"] = bool(brow["capacity_hit"])
+            blocked_report["capacity_window_seconds"] = brow[
+                "capacity_window_seconds"
+            ]
+            blocked_report["capacity_max_departures"] = brow[
+                "capacity_max_departures"
+            ]
+            blocked_report["capacity_anchor"] = brow["capacity_anchor"]
+            blocked_report["capacity_window"] = capacity_window
+        if brow["runway"] in group_of_runway:
+            group_window = None
+            if brow["mutex_group_window_start"] is not None:
+                group_window = {
+                    "start": _dt(brow["mutex_group_window_start"]),
+                    "end": _dt(brow["mutex_group_window_end"]),
+                }
+            blocked_report["mutex_group_hit"] = bool(brow["mutex_group_hit"])
+            blocked_report["mutex_group"] = brow["mutex_group_name"]
+            blocked_report["mutex_group_anchor"] = brow["mutex_group_anchor"]
+            blocked_report["mutex_group_min_interval_seconds"] = brow[
+                "mutex_group_min_interval_seconds"
+            ]
+            blocked_report["mutex_group_window"] = group_window
+
+    runways = []
+    total_delayed = 0
+    total_delay = 0
+    max_delay = 0
+    for runway in order_by_runway:
+        rw_items = items_by_runway.get(runway, [])
+        delayed = [i for i in rw_items if i["delay_seconds"] > 0]
+        rw_delay = sum(i["delay_seconds"] for i in rw_items)
+        rw_max = max((i["delay_seconds"] for i in rw_items), default=0)
+        total_delayed += len(delayed)
+        total_delay += rw_delay
+        max_delay = max(max_delay, rw_max)
+        runway_report = {
+            "runway": runway,
+            "total": len(order_by_runway[runway]),
+            "closures": closures_by_runway.get(runway, []),
+            "delayed_count": len(delayed),
+            "total_delay_seconds": rw_delay,
+            "max_delay_seconds": rw_max,
+            "items": rw_items,
+        }
+        if runway in capacities_by_runway:
+            runway_report["capacity"] = capacities_by_runway[runway]
+        if runway in group_of_runway:
+            runway_report["mutex_group"] = group_of_runway[runway]
+        if runway in locked_by_runway:
+            runway_report["locked_flights"] = locked_by_runway[runway]
+            runway_report["blocked"] = (
+                blocked_report
+                if blocked_report is not None
+                and blocked_report["runway"] == runway
+                else None
+            )
+        runways.append(runway_report)
+
+    result = {
+        "batch_id": row["batch_id"],
+        "mode": "joint_trial",
+        "created_at": row["created_at"],
+        "matrix": matrix,
+        "total_runways": len(order_by_runway),
+        "total_flights": sum(len(o) for o in order_by_runway.values()),
+        "groups": groups,
+        "order": [
+            {"runway": fr["runway"], "flight_no": fr["flight_no"]}
+            for fr in global_rows
+        ],
+        "total_delayed": total_delayed,
+        "total_delay_seconds": total_delay,
+        "max_delay_seconds": max_delay,
+        "runways": runways,
+    }
+    if batch_has_locks:
+        result["total_locked"] = sum(len(v) for v in locked_by_runway.values())
+    return result
+
+
+def _load_required_times(stored: str | None) -> dict:
+    """Parse the blocker's per-constraint required-times JSON, keeping the
+    fixed four-key contract (inapplicable constraints stay ``null``)."""
+    data = json.loads(stored) if stored else {}
+
+    def normalised(kind: str) -> dict | None:
+        payload = data.get(kind)
+        if payload is None:
+            return None
+        encoded = dict(payload)
+        encoded["required_off"] = _dt(payload["required_off"])
+        if "window" in payload and payload["window"] is not None:
+            encoded["window"] = {
+                "start": _dt(payload["window"]["start"]),
+                "end": _dt(payload["window"]["end"]),
+            }
+        return encoded
+
+    return {kind: normalised(kind) for kind in (
+        "wake",
+        "closure",
+        "capacity",
+        "mutex_group",
+    )}

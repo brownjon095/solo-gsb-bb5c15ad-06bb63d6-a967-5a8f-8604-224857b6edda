@@ -182,6 +182,94 @@ class WakeRequest(BaseModel):
         return self
 
 
+class MutexGroupIn(BaseModel):
+    """一组互斥（相交）跑道：组内任一跑道的两次相邻离场之间必须保持
+    ``min_interval_seconds`` 秒的最小占用间隔。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(
+        default=None,
+        description="组名（可选，仅用于回显与结果标注）；缺省按组在请求中的顺序"
+        "命名为 group-1、group-2 …",
+    )
+    runways: list[str] = Field(
+        ...,
+        min_length=2,
+        description="互斥跑道标识列表，至少 2 条；同一条跑道至多属于一个组。",
+    )
+    min_interval_seconds: int = Field(
+        ...,
+        ge=1,
+        strict=True,
+        description="组内两次相邻离场的最小占用间隔（秒），正整数",
+    )
+
+    @field_validator("runways")
+    @classmethod
+    def _strip_runway_names(cls, values: list[str]) -> list[str]:
+        cleaned = [v.strip() for v in values]
+        if any(not v for v in cleaned):
+            raise ValueError("互斥跑道组的跑道标识不能为空")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError(f"互斥跑道组内跑道标识重复: {cleaned}")
+        return cleaned
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+
+class JointTrialRequest(WakeRequest):
+    """联合试排请求：在 validate/trial 同一请求结构上增加互斥跑道组。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    groups: list[MutexGroupIn] | None = Field(
+        default=None,
+        description="互斥跑道组列表（可选）；组内任意跑道的两次相邻离场之间必须"
+        "保持 min_interval_seconds 秒。同一条跑道至多属于一个组。",
+    )
+
+    @model_validator(mode="after")
+    def _validate_groups(self) -> JointTrialRequest:
+        if not self.groups:
+            return self
+        runway_names = {rw.runway for rw in self.runways}
+        assigned: set[str] = set()
+        group_names: set[str] = set()
+        for index, group in enumerate(self.groups, start=1):
+            name = group.name or f"group-{index}"
+            if name in group_names:
+                raise ValueError(f"互斥跑道组名称重复: {name}")
+            group_names.add(name)
+            for runway in group.runways:
+                if runway not in runway_names:
+                    raise ValueError(
+                        f"互斥跑道组 {name} 引用了请求中不存在的跑道: {runway}"
+                    )
+                if runway in assigned:
+                    raise ValueError(
+                        f"跑道 {runway} 同时属于多个互斥跑道组；"
+                        "每条跑道至多可属于一个组"
+                    )
+                assigned.add(runway)
+        return self
+
+    def group_display_names(self) -> list[str]:
+        """Canonical group names in request order (missing names auto-filled)."""
+        if not self.groups:
+            return []
+        return [
+            group.name or f"group-{index}"
+            for index, group in enumerate(self.groups, start=1)
+        ]
+
+
 # ---------- response models ----------
 
 
@@ -581,6 +669,286 @@ class BestAdjacentSwapResponse(BaseModel):
     runways: list[RunwaySwapOut]
 
 
+class MutexGroupOut(BaseModel):
+    name: str
+    runways: list[str]
+    min_interval_seconds: int
+
+
+class RequiredWakeOut(BaseModel):
+    required_off: datetime
+    triggered_by: str
+    required_gap_seconds: int
+
+
+class RequiredClosureOut(BaseModel):
+    required_off: datetime
+    window: ClosureWindowOut
+
+
+class RequiredCapacityOut(BaseModel):
+    required_off: datetime
+    anchor_flight_no: str
+    window_seconds: int
+    max_departures: int
+    window: ClosureWindowOut
+
+
+class RequiredMutexGroupOut(BaseModel):
+    required_off: datetime
+    triggered_by: str
+    group: str
+    min_interval_seconds: int
+    window: ClosureWindowOut
+
+
+class JointRequiredTimesOut(BaseModel):
+    """Per-constraint earliest times for a blocked flight; inapplicable
+    constraints are ``None`` (e.g. no predecessor, no group membership)."""
+
+    wake: RequiredWakeOut | None = None
+    closure: RequiredClosureOut | None = None
+    capacity: RequiredCapacityOut | None = None
+    mutex_group: RequiredMutexGroupOut | None = None
+
+
+class JointTrialItemOut(BaseModel):
+    position: int
+    runway_position: int
+    runway: str
+    flight_no: str
+    wake: Wake
+    scheduled_off: datetime
+    adjusted_off: datetime
+    delay_seconds: int
+    # First constraint that demanded a push (wake/closure/capacity/mutex_group);
+    # null when the flight departs on schedule.
+    constraint: Literal["wake", "closure", "capacity", "mutex_group"] | None
+    triggered_by: str | None
+    closure_hit: bool
+    closure_window: ClosureWindowOut | None
+    has_locks: bool = Field(default=False, exclude=True)
+    locked: bool = False
+    has_capacity: bool = Field(default=False, exclude=True)
+    capacity_hit: bool = False
+    capacity_window_seconds: int | None = None
+    capacity_max_departures: int | None = None
+    capacity_anchor: str | None = None
+    capacity_window: ClosureWindowOut | None = None
+    in_group: bool = Field(default=False, exclude=True)
+    mutex_group_hit: bool = False
+    mutex_group: str | None = None
+    mutex_group_anchor: str | None = None
+    mutex_group_min_interval_seconds: int | None = None
+    mutex_group_window: ClosureWindowOut | None = None
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data: dict = {
+            "position": self.position,
+            "runway_position": self.runway_position,
+            "runway": self.runway,
+            "flight_no": self.flight_no,
+            "wake": self.wake,
+            "scheduled_off": self.scheduled_off,
+            "adjusted_off": self.adjusted_off,
+            "delay_seconds": self.delay_seconds,
+            "constraint": self.constraint,
+            "triggered_by": self.triggered_by,
+            "closure_hit": self.closure_hit,
+            "closure_window": (
+                self.closure_window.model_dump()
+                if self.closure_window is not None
+                else None
+            ),
+        }
+        if self.has_locks:
+            data["locked"] = self.locked
+        if self.has_capacity:
+            data["capacity_hit"] = self.capacity_hit
+            data["capacity_window_seconds"] = self.capacity_window_seconds
+            data["capacity_max_departures"] = self.capacity_max_departures
+            data["capacity_anchor"] = self.capacity_anchor
+            data["capacity_window"] = (
+                self.capacity_window.model_dump()
+                if self.capacity_window is not None
+                else None
+            )
+        if self.in_group:
+            data["mutex_group_hit"] = self.mutex_group_hit
+            data["mutex_group"] = self.mutex_group
+            data["mutex_group_anchor"] = self.mutex_group_anchor
+            data["mutex_group_min_interval_seconds"] = (
+                self.mutex_group_min_interval_seconds
+            )
+            data["mutex_group_window"] = (
+                self.mutex_group_window.model_dump()
+                if self.mutex_group_window is not None
+                else None
+            )
+        return data
+
+
+class JointBlockedOut(BaseModel):
+    position: int
+    runway_position: int
+    runway: str
+    flight_no: str
+    wake: Wake
+    scheduled_off: datetime
+    constraint: Literal["wake", "closure", "capacity", "mutex_group"]
+    required_earliest_off: datetime
+    # wake detail
+    triggered_by: str | None
+    required_gap_seconds: int | None
+    # closure detail
+    closure_hit: bool
+    closure_window: ClosureWindowOut | None
+    # per-constraint earliest times
+    required_times: JointRequiredTimesOut
+    has_capacity: bool = Field(default=False, exclude=True)
+    capacity_hit: bool = False
+    capacity_window_seconds: int | None = None
+    capacity_max_departures: int | None = None
+    capacity_anchor: str | None = None
+    capacity_window: ClosureWindowOut | None = None
+    in_group: bool = Field(default=False, exclude=True)
+    mutex_group_hit: bool = False
+    mutex_group: str | None = None
+    mutex_group_anchor: str | None = None
+    mutex_group_min_interval_seconds: int | None = None
+    mutex_group_window: ClosureWindowOut | None = None
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data: dict = {
+            "position": self.position,
+            "runway_position": self.runway_position,
+            "runway": self.runway,
+            "flight_no": self.flight_no,
+            "wake": self.wake,
+            "scheduled_off": self.scheduled_off,
+            "constraint": self.constraint,
+            "required_earliest_off": self.required_earliest_off,
+            "triggered_by": self.triggered_by,
+            "required_gap_seconds": self.required_gap_seconds,
+            "closure_hit": self.closure_hit,
+            "closure_window": (
+                self.closure_window.model_dump()
+                if self.closure_window is not None
+                else None
+            ),
+            "required_times": self.required_times.model_dump(mode="json"),
+        }
+        if self.has_capacity:
+            data["capacity_hit"] = self.capacity_hit
+            data["capacity_window_seconds"] = self.capacity_window_seconds
+            data["capacity_max_departures"] = self.capacity_max_departures
+            data["capacity_anchor"] = self.capacity_anchor
+            data["capacity_window"] = (
+                self.capacity_window.model_dump()
+                if self.capacity_window is not None
+                else None
+            )
+        if self.in_group:
+            data["mutex_group_hit"] = self.mutex_group_hit
+            data["mutex_group"] = self.mutex_group
+            data["mutex_group_anchor"] = self.mutex_group_anchor
+            data["mutex_group_min_interval_seconds"] = (
+                self.mutex_group_min_interval_seconds
+            )
+            data["mutex_group_window"] = (
+                self.mutex_group_window.model_dump()
+                if self.mutex_group_window is not None
+                else None
+            )
+        return data
+
+
+class RunwayJointOut(BaseModel):
+    runway: str
+    total: int
+    closures: list[ClosureWindowOut]
+    delayed_count: int
+    total_delay_seconds: int
+    max_delay_seconds: int
+    items: list[JointTrialItemOut]
+    has_capacity: bool = Field(default=False, exclude=True)
+    capacity: CapacityOut | None = None
+    in_group: bool = Field(default=False, exclude=True)
+    mutex_group: str | None = None
+    has_locks: bool = Field(default=False, exclude=True)
+    locked_flights: list[LockedFlightOut] = Field(default_factory=list)
+    # Set only for the runway holding the first infeasible locked flight;
+    # every runway's ``items`` then holds just the feasible global prefix
+    # restricted to that runway.
+    blocked: JointBlockedOut | None = None
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data: dict = {
+            "runway": self.runway,
+            "total": self.total,
+            "closures": [w.model_dump() for w in self.closures],
+            "delayed_count": self.delayed_count,
+            "total_delay_seconds": self.total_delay_seconds,
+            "max_delay_seconds": self.max_delay_seconds,
+            "items": [i.model_dump(mode="json") for i in self.items],
+        }
+        if self.has_capacity:
+            data["capacity"] = (
+                self.capacity.model_dump() if self.capacity is not None else None
+            )
+        if self.in_group:
+            data["mutex_group"] = self.mutex_group
+        if self.has_locks:
+            data["locked_flights"] = [
+                f.model_dump(mode="json") for f in self.locked_flights
+            ]
+            data["blocked"] = (
+                self.blocked.model_dump(mode="json")
+                if self.blocked is not None
+                else None
+            )
+        return data
+
+
+class JointTrialResponse(BaseModel):
+    batch_id: str
+    mode: str = "joint_trial"
+    matrix: dict[str, dict[str, int]]
+    total_runways: int
+    total_flights: int
+    groups: list[MutexGroupOut]
+    # global stable order as (runway, flight_no) pairs
+    order: list[dict]
+    total_delayed: int
+    total_delay_seconds: int
+    max_delay_seconds: int
+    runways: list[RunwayJointOut]
+    has_locks: bool = Field(default=False, exclude=True)
+    total_locked: int = 0
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        data: dict = {
+            "batch_id": self.batch_id,
+            "mode": self.mode,
+            "matrix": self.matrix,
+            "total_runways": self.total_runways,
+            "total_flights": self.total_flights,
+            "groups": [g.model_dump() for g in self.groups],
+            "order": self.order,
+            "total_delayed": self.total_delayed,
+            "total_delay_seconds": self.total_delay_seconds,
+            "max_delay_seconds": self.max_delay_seconds,
+            "runways": [rw.model_dump(mode="json") for rw in self.runways],
+        }
+        if self.has_locks:
+            data["total_locked"] = self.total_locked
+        return data
+
+
 class MatrixOut(BaseModel):
     matrix: dict[str, dict[str, int]]
 
@@ -606,6 +974,10 @@ class BatchResponse(BaseModel):
     total_locked: int | None = None
     total_baseline_delay_seconds: int | None = None
     total_saved_seconds: int | None = None
+    # joint_trial only
+    max_delay_seconds: int | None = None
+    groups: list[dict] | None = None
+    order: list[dict] | None = None
     runways: list[dict]
 
     @model_serializer(mode="plain")
@@ -628,6 +1000,9 @@ class BatchResponse(BaseModel):
             "total_locked",
             "total_baseline_delay_seconds",
             "total_saved_seconds",
+            "max_delay_seconds",
+            "groups",
+            "order",
         ):
             value = getattr(self, name)
             if value is not None:

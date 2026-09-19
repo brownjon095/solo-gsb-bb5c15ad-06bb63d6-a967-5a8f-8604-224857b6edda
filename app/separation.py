@@ -56,6 +56,7 @@ class Flight:
     scheduled_off: datetime  # always tz-aware, converted to UTC
     wake: str
     locked: bool = False  # trial must keep this flight exactly on scheduled_off
+    runway: str = ""  # owning runway identifier (filled in for joint trials)
 
     @property
     def t(self) -> int:

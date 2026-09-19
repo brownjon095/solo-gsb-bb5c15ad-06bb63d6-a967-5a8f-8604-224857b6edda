@@ -2,7 +2,7 @@
 
 基于 **Python + FastAPI + SQLite** 的跑道离场尾流（wake turbulence）间隔校验服务。
 客户端按跑道提交航班计划与前机—后机最小间隔矩阵，并可为每条跑道配置**临时关闭窗口**
-与**滚动容量约束**；航班可选 **`locked=true`（不可移动航班）**。服务端完成两件事：
+与**滚动容量约束**；航班可选 **`locked=true`（不可移动航班）**。服务端完成四件事：
 
 1. **间隔校验（validate）**：按计划离场时刻、航班号稳定排序，列出同跑道相邻航班的间隔违规、
    计划离场时刻落入关闭窗口的航班及其命中窗口，以及滚动容量约束的超限航班、触发窗口与
@@ -22,6 +22,13 @@
    尾流/关闭窗口/滚动容量规则从头试排并择优（总延误 → 最大单航班延误 → 交换位置），
    返回基线指标、选中的交换、优化后完整结果与节省秒数；请求含任意 `locked=true`
    时返回 `422`。
+4. **相交跑道联合试排（joint）**：请求可额外定义若干**互斥跑道组**及组内两次离场的
+   **最小占用间隔**（相交跑道不能同时占用）。先按 `(计划时刻, 航班号)` 确定**跨跑道
+   全局稳定顺序**，再逐项求不早于原计划、同时满足**本跑道**尾流间隔、关闭窗口避让、
+   滚动容量与**互斥组间隔**的最早时刻；任一约束推迟后全部相关约束重新检查、循环至
+   收敛。返回每项的首个触发约束、触发前序航班与延误。锁定航班若需后移则在该航班
+   （全局首个阻塞）处停止：返回阻塞航班、首个触发约束、最终最早合规时刻及**各约束
+   分别要求的时刻**（`required_times`），其后不再生成建议，仅持久化可行全局前缀。
 
 **兼容形状**：未在任何航班上传 `locked` 字段时，validate/trial/批次回查的响应与旧版本
 完全一致（不出现 `locked`、`locked_flights`、`blocked`、`total_locked` 字段）；显式传了
@@ -249,15 +256,114 @@ validate 额外返回**关闭冲突**：凡计划离场时刻落在某个窗口�
 > 交换后 M 先走、J 推迟到 00:01:50，总延误 110 秒 —— `chosen_swap.position=1`，
 > `saved_seconds=20`。
 
+### `POST /api/v1/trial/joint` — 相交跑道联合试排
+
+请求体在 validate/trial 同一结构（`runways` / `closures` / `capacity` / `matrix`）
+之上增加可选的 **`groups`（互斥跑道组）**：
+
+```json
+{
+  "runways": [
+    {
+      "runway": "36L",
+      "flights": [
+        {"flight_no": "CA1", "scheduled_off": "2026-09-18T08:00:00+08:00", "wake": "H"},
+        {"flight_no": "CA2", "scheduled_off": "2026-09-18T08:02:00+08:00", "wake": "M"}
+      ]
+    },
+    {
+      "runway": "18R",
+      "flights": [
+        {"flight_no": "MU1", "scheduled_off": "2026-09-18T08:00:30+08:00", "wake": "H"}
+      ]
+    }
+  ],
+  "groups": [
+    {"name": "cross", "runways": ["36L", "18R"], "min_interval_seconds": 90}
+  ]
+}
+```
+
+- `groups`：互斥跑道组列表（可省略，省略或为 `[]` 时各跑道独立试排，效果等同于
+  分跑道 trial）。每项：
+  - `name`：组名（可选），仅用于回显与结果标注；省略时按顺序命名为
+    `group-1`、`group-2` …，显式重名返回 `422`；
+  - `runways`：**至少 2 条**本请求中存在的跑道标识，组内不得重复；
+    **同一条跑道至多属于一个组**（违反返回 `422`）；
+  - `min_interval_seconds`：组内**任意跑道**两次相邻离场之间的最小占用间隔
+    （正整数秒，`0`/负数/小数/字符串/布尔均被拒绝）。
+- 不属于任何组的跑道照常按本跑道尾流/关闭/容量独立试排，不与组内跑道相互约束；
+  不同组之间也互不影响。
+
+#### 算法
+
+1. **全局稳定顺序**：把所有跑道的航班合并，按 `(scheduled_off 升序, flight_no 升序)`
+   排成唯一全局序列（航班号在整个请求内唯一，排序确定）。响应顶层 `order` 按该顺序
+   给出 `{runway, flight_no}` 对；每项另有 `position`（全局位次）与
+   `runway_position`（本跑道内稳定位次）。
+2. **逐项求最早时刻**，从全局顺序首架开始，每架航班只推迟、不提前，时刻取满足以下
+   **全部**条件的最早值：
+   1. 不早于本航班原计划；
+   2. 不早于**本跑道直接前机**调整时刻 + 尾流矩阵间隔；
+   3. 不落在**本跑道**任何关闭窗口内（落入则推迟到窗口 `end`，首尾相接继续迭代）；
+   4. 满足**本跑道**滚动容量（不早于前方第 `max_departures` 架调整时刻 + 窗口秒数）；
+   5. 不早于**同组最近一架离场**（无论它用哪条组内跑道）的调整时刻 + 组间隔。
+3. **收敛迭代**：尾流推迟可能落入关闭窗口、关闭/容量推迟可能破坏组间隔、组间隔推迟
+   也可能撞上本跑道关闭窗口……因此每次任一约束把时刻推后，都**从头重新检查全部
+   相关约束**，直到没有任何约束再要求推迟为止。延误沿全局顺序向后续航班（含其它
+   跑道与同组航班）级联。
+4. 每项返回 `adjusted_off` / `delay_seconds` 以及：
+   - `constraint`：**首个**要求推迟的约束，取值 `wake` / `closure` / `capacity` /
+     `mutex_group`，准点未动为 `null`（判定优先级同此顺序；最终时刻可能是多个约束
+     交替迭代的结果，各命中标记同时给出）；
+   - `triggered_by`：尾流直接前机航班号（未因尾流推迟为 `null`）；
+   - `closure_hit` / `closure_window`：本跑道关闭窗口命中明细；
+   - 本跑道配置了 capacity 时返回 `capacity_hit` / `capacity_anchor` /
+     `capacity_window_seconds` / `capacity_max_departures` / `capacity_window`，
+     跑道对象同时原样回显 `capacity`；
+   - 跑道属于某个组时返回 `mutex_group_hit`（是否因组间隔推迟）、`mutex_group`
+     （组名）、`mutex_group_anchor`（同组最近离场航班号）、
+     `mutex_group_min_interval_seconds` 与 `mutex_group_window`
+     （`[锚机调整时刻, +间隔)` 半开窗口），跑道对象同时回显 `mutex_group`。
+5. 顶层汇总 `total_delayed` / `total_delay_seconds` / `max_delay_seconds`（仅统计
+   可行前缀），并原样回显 `groups` 与全局 `order`。
+
+#### 锁定航班（locked）的联合试排语义
+
+- 锁定航班必须保持 `scheduled_off`，未锁定航班只后移、不提前。
+- 若全局顺序中**首个**锁定航班在全部约束收敛后仍需后移，则**整个联合试排立即
+  停止**：不挪动该航班、不生成违反约束的时刻，该航班及其后的所有航班（任何跑道）
+  **都不再给出建议**；每条跑道的 `items` 只含可行全局前缀中属于该跑道的航班级联。
+- 阻塞信息挂在阻塞航班所属跑道的 `blocked` 字段（其它跑道该字段为 `null`，且仅当
+  请求显式携带 `locked` 时出现），除与 trial 一致的明细外还包含：
+  - `runway` / `runway_position`：阻塞航班的跑道与跑道内位次；
+  - `constraint`：首个要求后移的约束（`wake` → `closure` → `capacity` →
+    `mutex_group` 优先级）；
+  - `required_earliest_off`：四类约束迭代收敛后的最终最早合规时刻（UTC）；
+  - **`required_times`**：各约束在收敛解下**分别**要求的时刻，固定四个键
+    `wake` / `closure` / `capacity` / `mutex_group`，不适用者为 `null`：
+    - `wake`：`{required_off, triggered_by, required_gap_seconds}`；
+    - `closure`：`{required_off, window{start,end}}`（最后一个导致推迟的窗口）；
+    - `capacity`：`{required_off, anchor_flight_no, window_seconds,
+      max_departures, window{start,end}}`；
+    - `mutex_group`：`{required_off, triggered_by, group,
+      min_interval_seconds, window{start,end}}`。
+- 跑道显式携带 `locked` 时照常回显 `locked_flights`，批次级汇总 `total_locked`。
+
+结果以 `mode="joint_trial"` 持久化（输入计划、全局顺序、互斥组、可行前缀每项明细
+与 blocker 的各约束所需时刻一并入库），可用批次 ID 原样回查。
+
 ### `GET /api/v1/batches/{batch_id}` — 批次回查
 
-所有 POST 接口（validate / trial / best-adjacent-swap）的返回都带 `batch_id`，可随时回查
-当时的输入顺序、生效矩阵、关闭窗口、容量配置与结论（validate 的违规/关闭冲突/容量超限、
-trial 的试排结果、best-adjacent-swap 的基线指标/选中交换/优化后结果），字段与对应 POST
-响应一致：配置了 capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的跑道**不出现**
-容量字段，保持旧响应形状。trial 的**可行前缀**（含每项 `locked`）与 `blocked`（若有）
-一并回查；仅当原请求显式携带 `locked` 时，回查结果才含 `locked_flights` / `blocked` /
-`total_locked`。不存在的 ID 返回 `404`。
+所有 POST 接口（validate / trial / best-adjacent-swap / joint）的返回都带 `batch_id`，
+可随时回查当时的输入顺序、生效矩阵、关闭窗口、容量配置与结论（validate 的违规/关闭
+冲突/容量超限、trial 的试排结果、best-adjacent-swap 的基线指标/选中交换/优化后结果、
+joint 的全局顺序/互斥组/可行前缀/阻塞明细），字段与对应 POST 响应一致：配置了
+capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的跑道**不出现**容量字段；
+属于互斥组的跑道回显 `mutex_group` 与组间隔明细，不属于组的跑道不出现组字段，保持
+旧响应形状。trial 的**可行前缀**（含每项 `locked`）与 `blocked`（若有）、joint 的
+**可行全局前缀**与 blocker 的 `required_times` 一并回查；仅当原请求显式携带 `locked`
+时，回查结果才含 `locked_flights` / `blocked` / `total_locked`。不存在的 ID 返回 `404`。
 
 ### 间隔矩阵（可选字段 `matrix`）
 
@@ -287,8 +393,10 @@ trial 的试排结果、best-adjacent-swap 的基线指标/选中交换/优化�
 ### 错误约定
 
 - `422`：请求体不合法（缺时区、航班号/跑道重复、尾流等级非法、矩阵条目非法、
-  关闭窗口结束不晚于开始或彼此重叠、容量字段非正整数、`locked` 非布尔值等），
-  或 best-adjacent-swap 请求含任意 `locked=true` 航班，响应体含中文原因。
+  关闭窗口结束不晚于开始或彼此重叠、容量字段非正整数、`locked` 非布尔值、
+  互斥组引用不存在的跑道/组内跑道重复/同一跑道属于多个组/组少于 2 条跑道/
+  组名重复/组间隔非正整数等），或 best-adjacent-swap 请求含任意 `locked=true`
+  航班，响应体含中文原因。
 - `404`：批次 ID 不存在。
 
 ---
@@ -314,6 +422,16 @@ curl -s -X POST http://localhost:8000/api/v1/trial/best-adjacent-swap \
         {"flight_no": "CA2", "scheduled_off": "2026-09-18T00:00:50Z", "wake": "M"}
       ]}]}'
 
+# 相交跑道联合试排（互斥组：36L 与 18R 两次离场至少间隔 90 秒）
+curl -s -X POST http://localhost:8000/api/v1/trial/joint \
+  -H 'Content-Type: application/json' \
+  -d '{"runways": [
+        {"runway": "36L", "flights": [
+          {"flight_no": "CA1", "scheduled_off": "2026-09-18T00:00:00Z", "wake": "H"}]},
+        {"runway": "18R", "flights": [
+          {"flight_no": "MU1", "scheduled_off": "2026-09-18T00:00:30Z", "wake": "H"}]}],
+       "groups": [{"runways": ["36L", "18R"], "min_interval_seconds": 90}]}'
+
 # 回查批次
 curl -s http://localhost:8000/api/v1/batches/<batch_id>
 ```
@@ -333,7 +451,7 @@ export WAKE_DB_PATH=./wake.db            # 可选，默认 /data/wake.db
 uvicorn app.main:app --reload --port 8000
 ```
 
-运行测试（含 87 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
+运行测试（含 119 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
 
 ```bash
 python3 -m pip install pytest httpx
@@ -344,13 +462,14 @@ python3 -m pytest -q
 
 ```
 app/
-  main.py         # FastAPI 路由（validate / trial / best-adjacent-swap / batches / 元信息）
-  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定合法性与兼容序列化）
+  main.py         # FastAPI 路由（validate / trial / best-adjacent-swap / trial/joint / batches / 元信息）
+  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定/互斥组合法性与兼容序列化）
   service.py      # 请求 -> 领域对象 -> 模式计算
+  joint.py        # 联合试排：全局稳定顺序、尾流/关闭/容量/互斥组间隔不动点迭代、锁定阻塞与各约束所需时刻
   separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、锁定航班可行性（blocker）、相邻交换枚举择优、默认矩阵
   timeutils.py    # 时区归一化（统一 UTC，整数秒运算）
-  database.py     # SQLite 连接、建表与旧库迁移（含 batches.mode CHECK 重建）
-  repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排/交换优化结果的持久化与回查
+  database.py     # SQLite 连接、建表与旧库迁移（含 batches.mode CHECK 重建、互斥组表与联合试排列）
+  repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排/交换/联合试排（含互斥组与各约束所需时刻）的持久化与回查
   config.py       # 环境变量配置
 tests/            # pytest 领域单测 + TestClient API 测试
 Dockerfile
