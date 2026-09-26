@@ -1119,9 +1119,13 @@ def test_init_db_migrates_legacy_batches_mode_check(tmp_path):
     assert check.execute("SELECT batch_id, mode FROM batches").fetchall() == [
         ("b1", "trial")
     ]
-    # the widened CHECK now accepts the new mode
+    # the widened CHECK now accepts the new modes
     check.execute(
         "INSERT INTO batches VALUES ('b2', 'best_adjacent_swap',"
+        " '2026-09-19T00:00:00+00:00', '{}')"
+    )
+    check.execute(
+        "INSERT INTO batches VALUES ('b3', 'joint_trial',"
         " '2026-09-19T00:00:00+00:00', '{}')"
     )
     # child tables still reference batches: inserts into them must work
@@ -1149,3 +1153,427 @@ def test_init_db_migrates_legacy_batches_mode_check(tmp_path):
     except sqlite3.IntegrityError:
         pass
     check.close()
+
+
+def test_init_db_migrates_pre_joint_trial_mode_check(tmp_path):
+    # databases created after best_adjacent_swap but before joint_trial have
+    # a CHECK without 'joint_trial'; init_db must rebuild and keep rows
+    import sqlite3
+
+    from app import database
+
+    db_file = tmp_path / "mid.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.execute(
+        "CREATE TABLE batches (batch_id TEXT PRIMARY KEY,"
+        " mode TEXT NOT NULL"
+        " CHECK (mode IN ('validate', 'trial', 'best_adjacent_swap')),"
+        " created_at TEXT NOT NULL, matrix_json TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO batches VALUES ('b1', 'best_adjacent_swap',"
+        " '2026-09-19T00:00:00+00:00', '{}')"
+    )
+    conn.commit()
+    conn.close()
+
+    database.init_db(str(db_file))
+
+    check = sqlite3.connect(str(db_file))
+    assert check.execute("SELECT batch_id, mode FROM batches").fetchall() == [
+        ("b1", "best_adjacent_swap")
+    ]
+    check.execute(
+        "INSERT INTO batches VALUES ('b2', 'joint_trial',"
+        " '2026-09-19T00:00:00+00:00', '{}')"
+    )
+    check.commit()
+    check.close()
+
+
+# ---------- joint trial (mutually exclusive runway groups) ----------
+
+
+JOINT_BODY = {
+    "runways": [
+        {
+            "runway": "18R",
+            "flights": [
+                _flight("MU1", "2026-09-18T00:01:00Z", "M"),
+                _flight("MU2", "2026-09-18T00:05:00Z", "M"),
+            ],
+        },
+        {
+            "runway": "36L",
+            "flights": [
+                _flight("CA1", "2026-09-18T00:00:00Z", "J"),
+                _flight("CA2", "2026-09-18T00:00:50Z", "M"),
+            ],
+        },
+    ],
+    "exclusive_groups": [
+        {"runways": ["36L", "18R"], "min_gap_seconds": 90},
+    ],
+}
+
+
+def test_joint_trial_basic_flow_and_persists(client):
+    r = client.post("/api/v1/trial/joint", json=JOINT_BODY)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["mode"] == "joint_trial"
+    assert data["total_runways"] == 2
+    assert data["total_flights"] == 4
+    # global stable order merges both runways
+    assert data["order"] == ["CA1", "CA2", "MU1", "MU2"]
+    assert data["exclusive_groups"] == [
+        {"index": 1, "runways": ["18R", "36L"], "min_gap_seconds": 90}
+    ]
+    assert data["blocked"] is None
+    assert data["total_delayed"] == 2
+    assert data["total_delay_seconds"] == 160
+    assert data["max_delay_seconds"] == 130
+
+    items = {i["flight_no"]: i for i in data["items"]}
+    assert [i["position"] for i in data["items"]] == [1, 2, 3, 4]
+    # CA2: wake J->M pushes 00:00:50 -> 00:03:00
+    assert items["CA2"]["adjusted_off"] == "2026-09-18T00:03:00Z"
+    assert items["CA2"]["constraint"] == "wake"
+    assert items["CA2"]["triggered_by"] == "CA1"
+    assert items["CA2"]["group_hit"] is False
+    # MU1: 00:01:00 is only 60 s after CA1 -> group-pushed to 00:01:30
+    mu1 = items["MU1"]
+    assert mu1["runway"] == "18R"
+    assert mu1["adjusted_off"] == "2026-09-18T00:01:30Z"
+    assert mu1["delay_seconds"] == 30
+    assert mu1["constraint"] == "group"
+    assert mu1["group_hit"] is True
+    assert mu1["group_index"] == 1
+    assert mu1["group_min_gap_seconds"] == 90
+    assert mu1["group_triggered_by"] == "CA1"
+    assert mu1["group_triggered_runway"] == "36L"
+    assert mu1["group_triggered_off"] == "2026-09-18T00:00:00Z"
+    assert mu1["group_required_off"] == "2026-09-18T00:01:30Z"
+    assert mu1["group_window"] == {
+        "start": "2026-09-18T00:00:00Z",
+        "end": "2026-09-18T00:01:30Z",
+    }
+    # MU2 untouched: 00:05:00 clears every constraint
+    assert items["MU2"]["delay_seconds"] == 0
+    assert items["MU2"]["constraint"] is None
+
+    # per-runway section echoes orders and closures
+    rw18 = next(x for x in data["runways"] if x["runway"] == "18R")
+    rw36 = next(x for x in data["runways"] if x["runway"] == "36L")
+    assert rw18["order"] == ["MU1", "MU2"]
+    assert rw36["order"] == ["CA1", "CA2"]
+    assert "capacity" not in rw18 and "locked_flights" not in rw18
+    # no capacity configured anywhere -> items carry no capacity keys
+    assert "capacity_hit" not in data["items"][0]
+    # no locked field in the request -> no lock keys at all
+    assert "total_locked" not in data
+    assert "locked" not in data["items"][0]
+
+    # persisted and re-fetchable through the existing batch endpoint
+    got = client.get(f"/api/v1/batches/{data['batch_id']}")
+    assert got.status_code == 200
+    fetched = got.json()
+    assert fetched["mode"] == "joint_trial"
+    for key in (
+        "matrix", "total_runways", "total_flights", "total_delayed",
+        "total_delay_seconds", "max_delay_seconds", "order",
+        "exclusive_groups", "items", "blocked", "runways",
+    ):
+        assert fetched[key] == data[key], key
+
+
+def test_joint_trial_without_groups_matches_independent_trials(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("CA1", "2026-09-18T00:00:00Z", "J"),
+                    _flight("CA2", "2026-09-18T00:00:50Z", "M"),
+                ],
+            },
+            {
+                "runway": "18R",
+                "flights": [
+                    _flight("MU1", "2026-09-18T00:00:10Z", "H"),
+                    _flight("MU2", "2026-09-18T00:00:40Z", "M"),
+                ],
+            },
+        ]
+    }
+    joint = client.post("/api/v1/trial/joint", json=body).json()
+    assert joint["exclusive_groups"] == []
+    assert joint["order"] == ["CA1", "MU1", "MU2", "CA2"]
+    trial = client.post("/api/v1/trial", json=body).json()
+    # identical per-flight adjustments as the independent per-runway trial
+    solo = {
+        i["flight_no"]: i["adjusted_off"]
+        for rw in trial["runways"]
+        for i in rw["items"]
+    }
+    assert {i["flight_no"]: i["adjusted_off"] for i in joint["items"]} == solo
+
+
+def test_joint_trial_group_push_into_closure_iterates(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [_flight("CA1", "2026-09-18T00:00:00Z", "M")],
+            },
+            {
+                "runway": "18R",
+                "flights": [_flight("MU1", "2026-09-18T00:00:30Z", "M")],
+                "closures": [
+                    {
+                        "start": "2026-09-18T00:01:30Z",
+                        "end": "2026-09-18T00:03:20Z",
+                    }
+                ],
+            },
+        ],
+        "matrix": [{"leader": "M", "follower": "M", "seconds": 0}],
+        "exclusive_groups": [
+            {"runways": ["36L", "18R"], "min_gap_seconds": 90},
+        ],
+    }
+    data = client.post("/api/v1/trial/joint", json=body).json()
+    mu1 = data["items"][1]
+    # group pushes 00:00:30 -> 00:01:30, inside the closure -> 00:03:20
+    assert mu1["adjusted_off"] == "2026-09-18T00:03:20Z"
+    assert mu1["group_hit"] is True
+    assert mu1["closure_hit"] is True
+    assert mu1["closure_window"] == {
+        "start": "2026-09-18T00:01:30Z",
+        "end": "2026-09-18T00:03:20Z",
+    }
+    assert mu1["constraint"] == "closure"
+
+
+def test_joint_trial_locked_blocked_by_group_stops_all_and_persists(client):
+    body = {
+        "runways": [
+            {
+                "runway": "18R",
+                "flights": [
+                    _lflight("MU1", "2026-09-18T00:01:00Z", "M", True),
+                    _flight("MU2", "2026-09-18T00:05:00Z", "M"),
+                ],
+            },
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("CA1", "2026-09-18T00:00:00Z", "J"),
+                    _flight("CA2", "2026-09-18T00:00:50Z", "M"),
+                ],
+            },
+        ],
+        "exclusive_groups": [
+            {"runways": ["36L", "18R"], "min_gap_seconds": 90},
+        ],
+    }
+    r = client.post("/api/v1/trial/joint", json=body)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["total_locked"] == 1
+    # feasible prefix only: CA1, CA2 placed; MU1 blocked; MU2 gets nothing
+    assert [i["flight_no"] for i in data["items"]] == ["CA1", "CA2"]
+    assert data["order"] == ["CA1", "CA2", "MU1", "MU2"]
+    blocked = data["blocked"]
+    assert blocked["flight_no"] == "MU1"
+    assert blocked["runway"] == "18R"
+    assert blocked["position"] == 3
+    assert blocked["constraint"] == "group"
+    assert blocked["required_earliest_off"] == "2026-09-18T00:01:30Z"
+    # per-constraint required instants: only the group demanded a push
+    assert blocked["group_required_off"] == "2026-09-18T00:01:30Z"
+    assert blocked["wake_required_off"] is None
+    assert blocked["closure_required_off"] is None
+    assert blocked["capacity_required_off"] is None
+    assert blocked["group_hit"] is True
+    assert blocked["group_triggered_by"] == "CA1"
+    assert blocked["group_triggered_runway"] == "36L"
+    assert blocked["group_window"] == {
+        "start": "2026-09-18T00:00:00Z",
+        "end": "2026-09-18T00:01:30Z",
+    }
+    # lock echo is per runway: 36L never carried ``locked`` -> no lock keys
+    # on its items; 18R echoes its locked flights in the runway section
+    assert "locked" not in data["items"][0]
+    rw18 = next(x for x in data["runways"] if x["runway"] == "18R")
+    assert rw18["locked_flights"][0]["flight_no"] == "MU1"
+
+    got = client.get(f"/api/v1/batches/{data['batch_id']}").json()
+    assert got["mode"] == "joint_trial"
+    assert got["total_locked"] == 1
+    for key in ("order", "exclusive_groups", "items", "blocked", "runways"):
+        assert got[key] == data[key], key
+
+
+def test_joint_trial_locked_blocked_by_wake_reports_all_required_offs(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("CA1", "2026-09-18T00:00:00Z", "J"),
+                    _lflight("CA2", "2026-09-18T00:01:00Z", "M", True),
+                ],
+                "closures": [
+                    {
+                        "start": "2026-09-18T00:02:30Z",
+                        "end": "2026-09-18T00:05:00Z",
+                    }
+                ],
+            },
+        ],
+    }
+    data = client.post("/api/v1/trial/joint", json=body).json()
+    assert [i["flight_no"] for i in data["items"]] == ["CA1"]
+    blocked = data["blocked"]
+    # wake pushes to 00:03:00, inside the closure -> converged 00:05:00
+    assert blocked["constraint"] == "wake"
+    assert blocked["wake_required_off"] == "2026-09-18T00:03:00Z"
+    assert blocked["closure_required_off"] == "2026-09-18T00:05:00Z"
+    assert blocked["required_earliest_off"] == "2026-09-18T00:05:00Z"
+    assert blocked["triggered_by"] == "CA1"
+    assert blocked["required_gap_seconds"] == 180
+    assert blocked["closure_hit"] is True
+    assert blocked["group_hit"] is False
+
+
+def test_joint_trial_capacity_detail_scoped_to_configured_runway(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _flight("CA1", "2026-09-18T00:00:00Z", "M"),
+                    _flight("CA2", "2026-09-18T00:00:30Z", "M"),
+                    _flight("CA3", "2026-09-18T00:00:59Z", "M"),
+                ],
+                "capacity": {"window_seconds": 60, "max_departures": 2},
+            },
+            {
+                "runway": "18R",
+                "flights": [_flight("MU1", "2026-09-18T00:10:00Z", "M")],
+            },
+        ],
+        "matrix": [{"leader": "M", "follower": "M", "seconds": 0}],
+        "exclusive_groups": [
+            {"runways": ["36L", "18R"], "min_gap_seconds": 30},
+        ],
+    }
+    data = client.post("/api/v1/trial/joint", json=body).json()
+    items = {i["flight_no"]: i for i in data["items"]}
+    # CA3 capacity-pushed to 00:01:00; group gap (30 s) already satisfied
+    assert items["CA3"]["adjusted_off"] == "2026-09-18T00:01:00Z"
+    assert items["CA3"]["capacity_hit"] is True
+    assert items["CA3"]["capacity_anchor"] == "CA1"
+    assert items["CA3"]["constraint"] == "capacity"
+    # runway without capacity -> no capacity keys on its items
+    assert "capacity_hit" not in items["MU1"]
+    rw36 = next(x for x in data["runways"] if x["runway"] == "36L")
+    rw18 = next(x for x in data["runways"] if x["runway"] == "18R")
+    assert rw36["capacity"] == {"window_seconds": 60, "max_departures": 2}
+    assert "capacity" not in rw18
+
+    got = client.get(f"/api/v1/batches/{data['batch_id']}").json()
+    g_items = {i["flight_no"]: i for i in got["items"]}
+    assert g_items["CA3"]["capacity_hit"] is True
+    assert "capacity_hit" not in g_items["MU1"]
+
+
+def test_joint_trial_group_validation_errors(client):
+    one_runway = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [_flight("CA1", "2026-09-18T00:00:00Z", "M")],
+            },
+            {
+                "runway": "18R",
+                "flights": [_flight("MU1", "2026-09-18T00:01:00Z", "M")],
+            },
+        ]
+    }
+    # group references an undefined runway
+    body = {**one_runway, "exclusive_groups": [
+        {"runways": ["36L", "09"], "min_gap_seconds": 60}
+    ]}
+    r = client.post("/api/v1/trial/joint", json=body)
+    assert r.status_code == 422 and "未定义" in r.text
+
+    # a runway in two groups
+    body = {**one_runway, "exclusive_groups": [
+        {"runways": ["36L", "18R"], "min_gap_seconds": 60},
+        {"runways": ["18R", "36L"], "min_gap_seconds": 30},
+    ]}
+    r = client.post("/api/v1/trial/joint", json=body)
+    assert r.status_code == 422 and "互斥组" in r.text
+
+    # fewer than two runways / duplicate runways inside a group
+    for runways in (["36L"], ["36L", "36L"]):
+        body = {**one_runway, "exclusive_groups": [
+            {"runways": runways, "min_gap_seconds": 60}
+        ]}
+        assert client.post("/api/v1/trial/joint", json=body).status_code == 422
+
+    # min_gap_seconds must be a positive strict integer
+    for gap in (0, -5, 1.5, "60", True):
+        body = {**one_runway, "exclusive_groups": [
+            {"runways": ["36L", "18R"], "min_gap_seconds": gap}
+        ]}
+        r = client.post("/api/v1/trial/joint", json=body)
+        assert r.status_code == 422, gap
+
+    # unknown fields inside a group stay rejected
+    body = {**one_runway, "exclusive_groups": [
+        {"runways": ["36L", "18R"], "min_gap_seconds": 60, "extra": 1}
+    ]}
+    assert client.post("/api/v1/trial/joint", json=body).status_code == 422
+
+    # exclusive_groups is a joint-only field: the other endpoints forbid it
+    assert client.post("/api/v1/trial", json={
+        **one_runway,
+        "exclusive_groups": [{"runways": ["36L", "18R"], "min_gap_seconds": 60}],
+    }).status_code == 422
+    assert client.post("/api/v1/validate", json={
+        **one_runway,
+        "exclusive_groups": [{"runways": ["36L", "18R"], "min_gap_seconds": 60}],
+    }).status_code == 422
+
+
+def test_joint_trial_explicit_locked_false_echoes_lock_shape(client):
+    body = {
+        "runways": [
+            {
+                "runway": "36L",
+                "flights": [
+                    _lflight("CA1", "2026-09-18T00:00:00Z", "M", False),
+                    _flight("CA2", "2026-09-18T00:01:00Z", "M"),
+                ],
+            },
+            {
+                "runway": "18R",
+                "flights": [_flight("MU1", "2026-09-18T00:02:00Z", "M")],
+            },
+        ],
+        "exclusive_groups": [
+            {"runways": ["36L", "18R"], "min_gap_seconds": 60},
+        ],
+    }
+    data = client.post("/api/v1/trial/joint", json=body).json()
+    assert data["total_locked"] == 0
+    rw36 = next(x for x in data["runways"] if x["runway"] == "36L")
+    rw18 = next(x for x in data["runways"] if x["runway"] == "18R")
+    assert rw36["locked_flights"] == []
+    assert "locked_flights" not in rw18
+    items = {i["flight_no"]: i for i in data["items"]}
+    assert items["CA1"]["locked"] is False
+    assert "locked" not in items["MU1"]

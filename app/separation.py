@@ -548,6 +548,445 @@ def trial_reschedule(
 
 
 @dataclass(frozen=True, slots=True)
+class ExclusiveGroup:
+    """A mutually exclusive runway group: departures on any two member
+    runways must be at least ``min_gap_seconds`` apart (intersecting-runway
+    occupancy separation)."""
+
+    index: int  # 1-based position in the request's exclusive_groups list
+    runways: frozenset[str]
+    min_gap_seconds: int
+
+
+@dataclass(slots=True)
+class JointTrialItem:
+    """One flight's joint-trial proposal, placed in the global stable order."""
+
+    flight_no: str
+    wake: str
+    runway: str
+    original_time: datetime
+    adjusted_time: datetime
+    delay_seconds: int
+    position: int  # 1-based slot in the global stable order
+    constraint: str | None  # first constraint that pushed: wake/closure/capacity/group
+    triggered_by: str | None  # same-runway leader that forced the wake pushback
+    closure_hit: bool
+    closure_window: ClosureWindow | None
+    locked: bool
+    capacity_hit: bool
+    capacity_window_seconds: int | None
+    capacity_max_departures: int | None
+    capacity_anchor: str | None
+    capacity_window_start: datetime | None
+    capacity_window_end: datetime | None
+    # exclusive-group detail (None when no group pushed this flight)
+    group_hit: bool
+    group_index: int | None
+    group_min_gap_seconds: int | None
+    group_triggered_by: str | None  # earlier same-group departure that pushed
+    group_triggered_runway: str | None
+    group_triggered_off: datetime | None  # that departure's adjusted time
+    group_required_off: datetime | None  # adjusted time demanded by the group
+    group_window_start: datetime | None  # [triggered_off, +min_gap) kept clear
+    group_window_end: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class JointBlocker:
+    """The first locked flight the joint trial cannot keep on schedule.
+
+    Computed in the global stable order; processing stops there — the flight
+    is not moved and no later flight receives a suggestion. Every constraint
+    that demanded a push reports the instant it required (``*_required_off``);
+    ``required_earliest_off`` is the converged earliest safe time after all
+    constraints were iterated to a fixed point.
+    """
+
+    flight_no: str
+    wake: str
+    runway: str
+    scheduled_off: datetime
+    position: int  # 1-based slot in the global stable order
+    constraint: str  # "wake" | "closure" | "capacity" | "group"
+    required_earliest_off: datetime
+    # per-constraint required instants (None when that constraint did not push)
+    wake_required_off: datetime | None
+    closure_required_off: datetime | None
+    capacity_required_off: datetime | None
+    group_required_off: datetime | None
+    # wake detail
+    triggered_by: str | None
+    required_gap_seconds: int | None
+    # closure detail
+    closure_hit: bool
+    closure_window: ClosureWindow | None
+    # capacity detail
+    capacity_hit: bool
+    capacity_window_seconds: int | None
+    capacity_max_departures: int | None
+    capacity_anchor: str | None
+    capacity_window_start: datetime | None
+    capacity_window_end: datetime | None
+    # exclusive-group detail
+    group_hit: bool
+    group_index: int | None
+    group_min_gap_seconds: int | None
+    group_triggered_by: str | None
+    group_triggered_runway: str | None
+    group_triggered_off: datetime | None
+    group_window_start: datetime | None
+    group_window_end: datetime | None
+
+
+@dataclass(slots=True)
+class JointTrialResult:
+    """Joint-trial outcome: a feasible global schedule, or a feasible prefix
+    followed by the first infeasible locked flight."""
+
+    items: list[JointTrialItem]
+    blocked: JointBlocker | None = None
+
+    @property
+    def feasible(self) -> bool:
+        return self.blocked is None
+
+
+def joint_trial_schedule(
+    flights_by_runway: dict[str, list[Flight]],
+    matrix: dict[tuple[str, str], int],
+    windows_by_runway: dict[str, list[ClosureWindow]],
+    capacities_by_runway: dict[str, Capacity],
+    groups: list[ExclusiveGroup],
+) -> JointTrialResult:
+    """Jointly reschedule every runway's departures in one global pass.
+
+    All flights are merged and processed in the global stable order
+    ``(scheduled_off, flight_no)`` — positions refer to that order. Each
+    flight is placed at the earliest instant that (a) is not earlier than its
+    scheduled time, (b) keeps the matrix gap behind the (already placed)
+    flight directly ahead of it *on the same runway*, (c) avoids every
+    closure window of its runway, (d) keeps its runway's rolling capacity
+    limit, and (e) for every mutually exclusive group its runway belongs to,
+    stays at least ``min_gap_seconds`` away from every already-placed
+    departure of the group's runways: a candidate time inside the open span
+    ``(t_other - min_gap, t_other + min_gap)`` of an earlier-processed
+    same-group departure — whether that departure ended up before *or after*
+    the candidate in clock time — is pushed to that span's end.
+
+    Whenever any constraint pushes the flight later, *all* constraints are
+    re-checked against the new candidate (a closure/capacity/group push may
+    land inside another closure window, another group's gap span, or ahead
+    of a later same-group departure), iterating until the candidate
+    converges — the constraints are monotone, so the fixed point is the
+    earliest jointly compliant instant. Delays cascade to later flights in
+    the global order.
+
+    A **locked** flight is immovable: if the converged earliest instant is
+    later than its ``scheduled_off``, processing stops immediately — the
+    flight is reported once as a :class:`JointBlocker` (first pushing
+    constraint in wake → closure → capacity → group priority, plus every
+    constraint's required instant), it is not moved, and no later flight
+    receives a suggestion. Only the feasible prefix is returned.
+    """
+    group_by_runway: dict[str, list[ExclusiveGroup]] = {}
+    for group in groups:
+        for runway in group.runways:
+            group_by_runway.setdefault(runway, []).append(group)
+
+    merged: list[tuple[str, Flight]] = [
+        (runway, flight)
+        for runway, flights in flights_by_runway.items()
+        for flight in flights
+    ]
+    merged.sort(key=lambda pair: pair[1].sort_key())
+
+    sorted_windows = {
+        runway: sort_windows(windows_by_runway.get(runway, []))
+        for runway in flights_by_runway
+    }
+    placed_by_runway: dict[str, list[JointTrialItem]] = {
+        runway: [] for runway in flights_by_runway
+    }
+    items: list[JointTrialItem] = []
+    for position, (runway, flight) in enumerate(merged, start=1):
+        windows = sorted_windows[runway]
+        capacity = capacities_by_runway.get(runway)
+        placed_here = placed_by_runway[runway]
+        flight_groups = group_by_runway.get(runway, [])
+
+        adjusted_t = flight.t
+        triggered_by: str | None = None
+        wake_required = 0
+        wake_required_t: int | None = None
+        if placed_here:
+            prev = placed_here[-1]
+            wake_required = required_gap(matrix, prev.wake, flight.wake)
+            earliest = to_epoch_seconds(prev.adjusted_time) + wake_required
+            if adjusted_t < earliest:
+                adjusted_t = earliest
+                triggered_by = prev.flight_no
+                wake_required_t = earliest
+
+        closure_hit = False
+        closure_window: ClosureWindow | None = None
+        closure_required_t: int | None = None
+        capacity_hit = False
+        capacity_anchor: JointTrialItem | None = None
+        capacity_window_t = 0
+        capacity_required_t: int | None = None
+        group_hit = False
+        group_trigger: ExclusiveGroup | None = None
+        group_trigger_item: JointTrialItem | None = None
+        group_required_t: int | None = None
+        while True:
+            pushed = False
+            for window in windows:
+                if adjusted_t < window.s:
+                    break  # in a gap before this (and every later) window
+                if window.contains(adjusted_t):
+                    adjusted_t = window.e
+                    closure_hit = True
+                    closure_window = window
+                    if closure_required_t is None or window.e > closure_required_t:
+                        closure_required_t = window.e
+                    pushed = True
+            if capacity is not None and len(placed_here) >= capacity.max_departures:
+                anchor_item = placed_here[len(placed_here) - capacity.max_departures]
+                anchor_t = to_epoch_seconds(anchor_item.adjusted_time)
+                earliest = anchor_t + capacity.window_seconds
+                if adjusted_t < earliest:
+                    adjusted_t = earliest
+                    capacity_hit = True
+                    capacity_anchor = anchor_item
+                    capacity_window_t = anchor_t
+                    if capacity_required_t is None or earliest > capacity_required_t:
+                        capacity_required_t = earliest
+                    pushed = True
+            for group in flight_groups:
+                for other in items:
+                    if other.runway not in group.runways:
+                        continue
+                    other_t = to_epoch_seconds(other.adjusted_time)
+                    # Mutual exclusion: the candidate must be at least
+                    # ``min_gap`` from every placed same-group departure, in
+                    # either clock direction. Flights can only be pushed
+                    # later, so an over-close later departure forces the
+                    # candidate past it (to other_t + min_gap).
+                    if other_t - group.min_gap_seconds < adjusted_t < (
+                        other_t + group.min_gap_seconds
+                    ):
+                        adjusted_t = other_t + group.min_gap_seconds
+                        group_hit = True
+                        group_trigger = group
+                        group_trigger_item = other
+                        if group_required_t is None or adjusted_t > group_required_t:
+                            group_required_t = adjusted_t
+                        pushed = True
+            if not pushed:
+                break
+
+        if flight.locked and adjusted_t > flight.t:
+            # Immovable flight: name the first constraint that demanded a
+            # push (wake, then closure, then capacity, then group) and stop.
+            if triggered_by is not None:
+                constraint = "wake"
+            elif closure_hit:
+                constraint = "closure"
+            elif capacity_hit:
+                constraint = "capacity"
+            else:
+                constraint = "group"
+            blocked = JointBlocker(
+                flight_no=flight.flight_no,
+                wake=flight.wake,
+                runway=runway,
+                scheduled_off=flight.scheduled_off,
+                position=position,
+                constraint=constraint,
+                required_earliest_off=datetime.fromtimestamp(
+                    adjusted_t, tz=timezone.utc
+                ),
+                wake_required_off=(
+                    datetime.fromtimestamp(wake_required_t, tz=timezone.utc)
+                    if wake_required_t is not None
+                    else None
+                ),
+                closure_required_off=(
+                    datetime.fromtimestamp(closure_required_t, tz=timezone.utc)
+                    if closure_required_t is not None
+                    else None
+                ),
+                capacity_required_off=(
+                    datetime.fromtimestamp(capacity_required_t, tz=timezone.utc)
+                    if capacity_required_t is not None
+                    else None
+                ),
+                group_required_off=(
+                    datetime.fromtimestamp(group_required_t, tz=timezone.utc)
+                    if group_required_t is not None
+                    else None
+                ),
+                triggered_by=triggered_by,
+                required_gap_seconds=(
+                    wake_required if triggered_by is not None else None
+                ),
+                closure_hit=closure_hit,
+                closure_window=closure_window,
+                capacity_hit=capacity_hit,
+                capacity_window_seconds=(
+                    capacity.window_seconds
+                    if capacity_hit and capacity is not None
+                    else None
+                ),
+                capacity_max_departures=(
+                    capacity.max_departures
+                    if capacity_hit and capacity is not None
+                    else None
+                ),
+                capacity_anchor=(
+                    capacity_anchor.flight_no if capacity_anchor is not None else None
+                ),
+                capacity_window_start=(
+                    datetime.fromtimestamp(capacity_window_t, tz=timezone.utc)
+                    if capacity_anchor is not None
+                    else None
+                ),
+                capacity_window_end=(
+                    datetime.fromtimestamp(
+                        capacity_window_t + capacity.window_seconds,
+                        tz=timezone.utc,
+                    )
+                    if capacity_anchor is not None and capacity is not None
+                    else None
+                ),
+                group_hit=group_hit,
+                group_index=group_trigger.index if group_trigger is not None else None,
+                group_min_gap_seconds=(
+                    group_trigger.min_gap_seconds
+                    if group_trigger is not None
+                    else None
+                ),
+                group_triggered_by=(
+                    group_trigger_item.flight_no
+                    if group_trigger_item is not None
+                    else None
+                ),
+                group_triggered_runway=(
+                    group_trigger_item.runway
+                    if group_trigger_item is not None
+                    else None
+                ),
+                group_triggered_off=(
+                    group_trigger_item.adjusted_time
+                    if group_trigger_item is not None
+                    else None
+                ),
+                group_window_start=(
+                    group_trigger_item.adjusted_time
+                    if group_trigger_item is not None
+                    else None
+                ),
+                group_window_end=(
+                    datetime.fromtimestamp(
+                        to_epoch_seconds(group_trigger_item.adjusted_time)
+                        + group_trigger.min_gap_seconds,
+                        tz=timezone.utc,
+                    )
+                    if group_trigger_item is not None and group_trigger is not None
+                    else None
+                ),
+            )
+            return JointTrialResult(items=items, blocked=blocked)
+
+        if triggered_by is not None:
+            first_constraint: str | None = "wake"
+        elif closure_hit:
+            first_constraint = "closure"
+        elif capacity_hit:
+            first_constraint = "capacity"
+        elif group_hit:
+            first_constraint = "group"
+        else:
+            first_constraint = None
+        item = JointTrialItem(
+            flight_no=flight.flight_no,
+            wake=flight.wake,
+            runway=runway,
+            original_time=flight.scheduled_off,
+            adjusted_time=datetime.fromtimestamp(adjusted_t, tz=timezone.utc),
+            delay_seconds=adjusted_t - flight.t,
+            position=position,
+            constraint=first_constraint,
+            triggered_by=triggered_by,
+            closure_hit=closure_hit,
+            closure_window=closure_window,
+            locked=flight.locked,
+            capacity_hit=capacity_hit,
+            capacity_window_seconds=(
+                capacity.window_seconds if capacity is not None else None
+            ),
+            capacity_max_departures=(
+                capacity.max_departures if capacity is not None else None
+            ),
+            capacity_anchor=(
+                capacity_anchor.flight_no if capacity_anchor is not None else None
+            ),
+            capacity_window_start=(
+                datetime.fromtimestamp(capacity_window_t, tz=timezone.utc)
+                if capacity_anchor is not None
+                else None
+            ),
+            capacity_window_end=(
+                datetime.fromtimestamp(
+                    capacity_window_t + capacity.window_seconds,
+                    tz=timezone.utc,
+                )
+                if capacity_anchor is not None and capacity is not None
+                else None
+            ),
+            group_hit=group_hit,
+            group_index=group_trigger.index if group_trigger is not None else None,
+            group_min_gap_seconds=(
+                group_trigger.min_gap_seconds if group_trigger is not None else None
+            ),
+            group_triggered_by=(
+                group_trigger_item.flight_no if group_trigger_item is not None else None
+            ),
+            group_triggered_runway=(
+                group_trigger_item.runway if group_trigger_item is not None else None
+            ),
+            group_triggered_off=(
+                group_trigger_item.adjusted_time
+                if group_trigger_item is not None
+                else None
+            ),
+            group_required_off=(
+                datetime.fromtimestamp(group_required_t, tz=timezone.utc)
+                if group_required_t is not None
+                else None
+            ),
+            group_window_start=(
+                group_trigger_item.adjusted_time
+                if group_trigger_item is not None
+                else None
+            ),
+            group_window_end=(
+                datetime.fromtimestamp(
+                    to_epoch_seconds(group_trigger_item.adjusted_time)
+                    + group_trigger.min_gap_seconds,
+                    tz=timezone.utc,
+                )
+                if group_trigger_item is not None and group_trigger is not None
+                else None
+            ),
+        )
+        items.append(item)
+        placed_here.append(item)
+    return JointTrialResult(items=items, blocked=None)
+
+
+@dataclass(frozen=True, slots=True)
 class AdjacentSwap:
     """The chosen adjacent swap, addressed against the baseline stable order.
 

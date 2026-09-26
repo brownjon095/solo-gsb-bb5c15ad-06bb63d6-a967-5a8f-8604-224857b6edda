@@ -12,7 +12,7 @@ from .config import settings
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS batches (
     batch_id    TEXT PRIMARY KEY,
-    mode        TEXT NOT NULL CHECK (mode IN ('validate', 'trial', 'best_adjacent_swap')),
+    mode        TEXT NOT NULL CHECK (mode IN ('validate', 'trial', 'best_adjacent_swap', 'joint_trial')),
     created_at  TEXT NOT NULL,
     matrix_json TEXT NOT NULL
 );
@@ -152,6 +152,85 @@ CREATE TABLE IF NOT EXISTS swap_results (
     UNIQUE(batch_id, runway)
 );
 
+CREATE TABLE IF NOT EXISTS exclusive_groups (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+    group_index     INTEGER NOT NULL,
+    runway          TEXT NOT NULL,
+    min_gap_seconds INTEGER NOT NULL,
+    UNIQUE(batch_id, group_index, runway)
+);
+
+CREATE TABLE IF NOT EXISTS joint_trial_items (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id       TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+    position       INTEGER NOT NULL,
+    flight_no      TEXT NOT NULL,
+    wake           TEXT NOT NULL,
+    runway         TEXT NOT NULL,
+    scheduled_off  TEXT NOT NULL,
+    adjusted_off   TEXT NOT NULL,
+    delay_seconds  INTEGER NOT NULL,
+    constraint_type TEXT,
+    triggered_by   TEXT,
+    closure_hit    INTEGER NOT NULL DEFAULT 0,
+    closure_window_start TEXT,
+    closure_window_end   TEXT,
+    locked         INTEGER NOT NULL DEFAULT 0,
+    capacity_hit   INTEGER NOT NULL DEFAULT 0,
+    capacity_window_seconds INTEGER,
+    capacity_max_departures INTEGER,
+    capacity_anchor TEXT,
+    capacity_window_start TEXT,
+    capacity_window_end   TEXT,
+    group_hit      INTEGER NOT NULL DEFAULT 0,
+    group_index    INTEGER,
+    group_min_gap_seconds INTEGER,
+    group_triggered_by TEXT,
+    group_triggered_runway TEXT,
+    group_triggered_off TEXT,
+    group_required_off TEXT,
+    group_window_start TEXT,
+    group_window_end   TEXT,
+    UNIQUE(batch_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS joint_trial_blockers (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id               TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+    position               INTEGER NOT NULL,
+    flight_no              TEXT NOT NULL,
+    wake                   TEXT NOT NULL,
+    runway                 TEXT NOT NULL,
+    scheduled_off          TEXT NOT NULL,
+    constraint_type        TEXT NOT NULL,
+    required_earliest_off  TEXT NOT NULL,
+    wake_required_off      TEXT,
+    closure_required_off   TEXT,
+    capacity_required_off  TEXT,
+    group_required_off     TEXT,
+    triggered_by           TEXT,
+    required_gap_seconds   INTEGER,
+    closure_hit            INTEGER NOT NULL DEFAULT 0,
+    closure_window_start   TEXT,
+    closure_window_end     TEXT,
+    capacity_hit           INTEGER NOT NULL DEFAULT 0,
+    capacity_window_seconds   INTEGER,
+    capacity_max_departures   INTEGER,
+    capacity_anchor        TEXT,
+    capacity_window_start  TEXT,
+    capacity_window_end    TEXT,
+    group_hit              INTEGER NOT NULL DEFAULT 0,
+    group_index            INTEGER,
+    group_min_gap_seconds  INTEGER,
+    group_triggered_by     TEXT,
+    group_triggered_runway TEXT,
+    group_triggered_off    TEXT,
+    group_window_start     TEXT,
+    group_window_end       TEXT,
+    UNIQUE(batch_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_flights_batch ON flights(batch_id);
 CREATE INDEX IF NOT EXISTS idx_violations_batch ON violations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_trial_batch ON trial_items(batch_id);
@@ -161,6 +240,9 @@ CREATE INDEX IF NOT EXISTS idx_capacities_batch ON capacities(batch_id);
 CREATE INDEX IF NOT EXISTS idx_capacity_violations_batch ON capacity_violations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_trial_blockers_batch ON trial_blockers(batch_id);
 CREATE INDEX IF NOT EXISTS idx_swap_results_batch ON swap_results(batch_id);
+CREATE INDEX IF NOT EXISTS idx_exclusive_groups_batch ON exclusive_groups(batch_id);
+CREATE INDEX IF NOT EXISTS idx_joint_trial_items_batch ON joint_trial_items(batch_id);
+CREATE INDEX IF NOT EXISTS idx_joint_trial_blockers_batch ON joint_trial_blockers(batch_id);
 """
 
 # Columns added after the initial release: existing database files (e.g. the
@@ -191,8 +273,9 @@ def _rebuild_batches_if_needed(conn: sqlite3.Connection) -> None:
     """Rebuild ``batches`` when its ``mode`` CHECK predates new modes.
 
     Databases created before the best-adjacent-swap release constrain
-    ``mode`` to ``('validate', 'trial')``; SQLite cannot alter a CHECK, so
-    the table is rebuilt in place (rows preserved) using the canonical
+    ``mode`` to ``('validate', 'trial')``, and those created before the
+    joint-trial release lack ``'joint_trial'``; SQLite cannot alter a CHECK,
+    so the table is rebuilt in place (rows preserved) using the canonical
     create-new / copy / drop-old / rename sequence. Foreign keys are
     disabled for the duration so dropping the old parent table neither
     cascades into child tables nor leaves their REFERENCES clauses
@@ -201,7 +284,7 @@ def _rebuild_batches_if_needed(conn: sqlite3.Connection) -> None:
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'batches'"
     ).fetchone()
-    if row is None or "best_adjacent_swap" in row[0]:
+    if row is None or "joint_trial" in row[0]:
         return
     conn.execute("PRAGMA foreign_keys=OFF")
     try:
@@ -211,7 +294,8 @@ def _rebuild_batches_if_needed(conn: sqlite3.Connection) -> None:
             "CREATE TABLE batches_new ("
             " batch_id TEXT PRIMARY KEY,"
             " mode TEXT NOT NULL"
-            " CHECK (mode IN ('validate', 'trial', 'best_adjacent_swap')),"
+            " CHECK (mode IN ('validate', 'trial', 'best_adjacent_swap',"
+            " 'joint_trial')),"
             " created_at TEXT NOT NULL,"
             " matrix_json TEXT NOT NULL)"
         )

@@ -15,7 +15,13 @@ from .schemas import (
     BatchResponse,
     BestAdjacentSwapResponse,
     ClosureWindowOut,
+    ExclusiveGroupOut,
     HealthOut,
+    JointBlockedOut,
+    JointRunwayOut,
+    JointTrialItemOut,
+    JointTrialRequest,
+    JointTrialResponse,
     LockedFlightOut,
     MatrixOut,
     RunwayReportOut,
@@ -30,7 +36,13 @@ from .schemas import (
     default_matrix_nested,
 )
 from .separation import ClosureWindow, delay_stats
-from .service import nested_matrix, run_best_adjacent_swap, run_trial, run_validate
+from .service import (
+    nested_matrix,
+    run_best_adjacent_swap,
+    run_joint_trial,
+    run_trial,
+    run_validate,
+)
 from .config import settings
 
 
@@ -51,8 +63,13 @@ app = FastAPI(
         "所需最早时刻，仅持久化可行前缀。best-adjacent-swap 在试排基础上"
         "枚举每一对相邻航班的交换并择优（总延误 → 最大单航班延误 → 交换位置），"
         "给出基线指标、选中的交换与节省秒数（含 locked=true 的请求返回 422）。"
+        "joint 联合试排面向相交跑道：请求可定义若干互斥跑道组及组内两次离场的"
+        "最小占用间隔，全部航班按计划时刻与航班号合成全局稳定顺序后逐项求"
+        "不早于原计划、同时满足本跑道尾流/关闭窗口/滚动容量与互斥组间隔的"
+        "最早时刻（任一约束推迟后重新检查全部约束直至收敛）；锁定航班若需"
+        "后移则返回首个阻塞航班与各约束所需时刻，其后不再给出建议。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -74,6 +91,7 @@ def root() -> dict:
             "validate": "POST /api/v1/validate",
             "trial": "POST /api/v1/trial",
             "best_adjacent_swap": "POST /api/v1/trial/best-adjacent-swap",
+            "joint_trial": "POST /api/v1/trial/joint",
             "batch": "GET /api/v1/batches/{batch_id}",
         },
     }
@@ -480,6 +498,226 @@ def best_adjacent_swap_endpoint(
     )
 
 
+def _joint_item_out(
+    item, *, has_capacity: bool, has_locks: bool
+) -> JointTrialItemOut:
+    """Serialisable joint-trial item; capacity/lock detail follows the flags."""
+    return JointTrialItemOut(
+        position=item.position,
+        flight_no=item.flight_no,
+        wake=item.wake,
+        runway=item.runway,
+        scheduled_off=item.original_time,
+        adjusted_off=item.adjusted_time,
+        delay_seconds=item.delay_seconds,
+        constraint=item.constraint,
+        triggered_by=item.triggered_by,
+        closure_hit=item.closure_hit,
+        closure_window=(
+            ClosureWindowOut(
+                start=item.closure_window.start, end=item.closure_window.end
+            )
+            if item.closure_window
+            else None
+        ),
+        has_locks=has_locks,
+        locked=item.locked,
+        has_capacity=has_capacity,
+        capacity_hit=item.capacity_hit,
+        capacity_window_seconds=item.capacity_window_seconds,
+        capacity_max_departures=item.capacity_max_departures,
+        capacity_anchor=item.capacity_anchor,
+        capacity_window=(
+            ClosureWindowOut(
+                start=item.capacity_window_start, end=item.capacity_window_end
+            )
+            if item.capacity_window_start is not None
+            else None
+        ),
+        group_hit=item.group_hit,
+        group_index=item.group_index,
+        group_min_gap_seconds=item.group_min_gap_seconds,
+        group_triggered_by=item.group_triggered_by,
+        group_triggered_runway=item.group_triggered_runway,
+        group_triggered_off=item.group_triggered_off,
+        group_required_off=item.group_required_off,
+        group_window=(
+            ClosureWindowOut(
+                start=item.group_window_start, end=item.group_window_end
+            )
+            if item.group_window_start is not None
+            else None
+        ),
+    )
+
+
+def _joint_blocked_out(blocked, *, has_capacity: bool) -> JointBlockedOut:
+    return JointBlockedOut(
+        flight_no=blocked.flight_no,
+        wake=blocked.wake,
+        runway=blocked.runway,
+        scheduled_off=blocked.scheduled_off,
+        position=blocked.position,
+        constraint=blocked.constraint,
+        required_earliest_off=blocked.required_earliest_off,
+        wake_required_off=blocked.wake_required_off,
+        closure_required_off=blocked.closure_required_off,
+        capacity_required_off=blocked.capacity_required_off,
+        group_required_off=blocked.group_required_off,
+        triggered_by=blocked.triggered_by,
+        required_gap_seconds=blocked.required_gap_seconds,
+        closure_hit=blocked.closure_hit,
+        closure_window=(
+            ClosureWindowOut(
+                start=blocked.closure_window.start, end=blocked.closure_window.end
+            )
+            if blocked.closure_window
+            else None
+        ),
+        has_capacity=has_capacity,
+        capacity_hit=blocked.capacity_hit,
+        capacity_window_seconds=blocked.capacity_window_seconds,
+        capacity_max_departures=blocked.capacity_max_departures,
+        capacity_anchor=blocked.capacity_anchor,
+        capacity_window=(
+            ClosureWindowOut(
+                start=blocked.capacity_window_start,
+                end=blocked.capacity_window_end,
+            )
+            if blocked.capacity_window_start is not None
+            else None
+        ),
+        group_hit=blocked.group_hit,
+        group_index=blocked.group_index,
+        group_min_gap_seconds=blocked.group_min_gap_seconds,
+        group_triggered_by=blocked.group_triggered_by,
+        group_triggered_runway=blocked.group_triggered_runway,
+        group_triggered_off=blocked.group_triggered_off,
+        group_window=(
+            ClosureWindowOut(
+                start=blocked.group_window_start, end=blocked.group_window_end
+            )
+            if blocked.group_window_start is not None
+            else None
+        ),
+    )
+
+
+def _global_order(payloads: dict) -> list[str]:
+    """Flight numbers of every runway merged into the global stable order."""
+    merged = [
+        flight
+        for flights in payloads.values()
+        for flight in flights
+    ]
+    merged.sort(key=lambda f: f.sort_key())
+    return [f.flight_no for f in merged]
+
+
+@app.post("/api/v1/trial/joint", response_model=JointTrialResponse, tags=["wake"])
+def joint_trial(
+    req: JointTrialRequest, db: sqlite3.Connection = Depends(get_db)
+) -> JointTrialResponse:
+    """相交跑道联合试排：全部跑道的航班先按计划时刻与航班号合成全局稳定
+    顺序，再逐项求不早于原计划、同时满足本跑道尾流间隔、关闭窗口、滚动
+    容量与互斥跑道组最小占用间隔的最早时刻；任一约束推迟后重新检查全部
+    约束直至收敛，延误沿全局顺序向后级联，原计划不变。
+
+    锁定航班（locked=true）不可移动：若收敛后的最早时刻晚于其
+    scheduled_off，则整个联合试排立即停止——返回首个阻塞航班、首个
+    触发约束与每一类约束各自所需的时刻，该航班及其后（全局顺序）的航班
+    不再给出建议，items 只含此前的可行前缀。
+    """
+    (
+        payloads,
+        matrix,
+        windows,
+        capacities,
+        groups,
+        result,
+        locked_runways,
+        locked_flights,
+    ) = run_joint_trial(req)
+    batch_id = save_batch(
+        db,
+        mode="joint_trial",
+        matrix=matrix,
+        runway_payloads=payloads,
+        closures_by_runway=windows,
+        capacities_by_runway=capacities,
+        locked_runways=locked_runways,
+        exclusive_groups=groups,
+        joint_trial=result,
+    )
+
+    items = result.items
+    total_locked = sum(len(v) for v in locked_flights.values() if v)
+    runway_outs: list[JointRunwayOut] = []
+    for runway, flights in payloads.items():
+        capacity = capacities.get(runway)
+        runway_has_locks = runway in locked_runways
+        locked_no_set = set(locked_flights.get(runway, []))
+        runway_outs.append(
+            JointRunwayOut(
+                runway=runway,
+                order=[f.flight_no for f in flights],
+                total=len(flights),
+                closures=[_window_out(w) for w in windows[runway]],
+                has_capacity=capacity is not None,
+                capacity=_capacity_out(capacity) if capacity is not None else None,
+                has_locks=runway_has_locks,
+                locked_flights=[
+                    LockedFlightOut(
+                        position=pos,
+                        flight_no=f.flight_no,
+                        scheduled_off=f.scheduled_off,
+                        wake=f.wake,
+                    )
+                    for pos, f in enumerate(flights, start=1)
+                    if f.flight_no in locked_no_set
+                ],
+            )
+        )
+
+    blocked = result.blocked
+    return JointTrialResponse(
+        batch_id=batch_id,
+        matrix=nested_matrix(matrix),
+        total_runways=len(payloads),
+        total_flights=sum(len(f) for f in payloads.values()),
+        total_delayed=sum(1 for i in items if i.delay_seconds > 0),
+        total_delay_seconds=sum(i.delay_seconds for i in items),
+        max_delay_seconds=max((i.delay_seconds for i in items), default=0),
+        order=_global_order(payloads),
+        exclusive_groups=[
+            ExclusiveGroupOut(
+                index=g.index,
+                runways=sorted(g.runways),
+                min_gap_seconds=g.min_gap_seconds,
+            )
+            for g in groups
+        ],
+        items=[
+            _joint_item_out(
+                i,
+                has_capacity=i.runway in capacities,
+                has_locks=i.runway in locked_runways,
+            )
+            for i in items
+        ],
+        blocked=(
+            _joint_blocked_out(
+                blocked, has_capacity=blocked.runway in capacities
+            )
+            if blocked is not None
+            else None
+        ),
+        runways=runway_outs,
+        has_locks=bool(locked_runways),
+        total_locked=total_locked,
+    )
+
+
 @app.get(
     "/api/v1/batches/{batch_id}",
     response_model=BatchResponse,
@@ -488,7 +726,7 @@ def best_adjacent_swap_endpoint(
 def get_batch(
     batch_id: str, db: sqlite3.Connection = Depends(get_db)
 ) -> BatchResponse:
-    """读取已保存的批次（validate / trial / best_adjacent_swap 均可）。"""
+    """读取已保存的批次（validate / trial / best_adjacent_swap / joint_trial 均可）。"""
     data = load_batch(db, batch_id)
     if data is None:
         raise HTTPException(status_code=404, detail=f"批次不存在: {batch_id}")

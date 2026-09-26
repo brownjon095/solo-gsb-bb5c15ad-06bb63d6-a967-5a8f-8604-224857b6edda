@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from .schemas import WakeRequest, matrix_to_nested
+from .schemas import JointTrialRequest, WakeRequest, matrix_to_nested
 from .separation import (
     Capacity,
     ClosureConflict,
     ClosureWindow,
+    ExclusiveGroup,
     Flight,
+    JointTrialResult,
     SwapRunwayResult,
     TrialRunwayResult,
     Violation,
@@ -16,6 +18,7 @@ from .separation import (
     find_capacity_violations,
     find_closure_conflicts,
     find_violations,
+    joint_trial_schedule,
     sort_flights,
     sort_windows,
     trial_reschedule,
@@ -189,6 +192,49 @@ def run_best_adjacent_swap(req: WakeRequest) -> tuple[
         for runway, flights in payloads.items()
     }
     return payloads, matrix, windows, capacities, swaps
+
+
+def run_joint_trial(req: JointTrialRequest) -> tuple[
+    dict[str, list[Flight]],
+    dict[tuple[str, str], int],
+    dict[str, list[ClosureWindow]],
+    dict[str, Capacity],
+    list[ExclusiveGroup],
+    JointTrialResult,
+    set[str],
+    dict[str, list[str]],
+]:
+    """Jointly reschedule all runways in one global stable-order pass.
+
+    The request's mutually exclusive groups are already validated (member
+    runways defined, no runway in two groups); here they become domain
+    objects and every runway's flights are merged into a single sequence.
+    """
+    payloads = _build_runway_flights(req)
+    windows = _build_runway_windows(req)
+    capacities = _build_runway_capacities(req)
+    matrix = _matrix_from_request(req)
+    groups = [
+        ExclusiveGroup(
+            index=index,
+            runways=frozenset(group.runways),
+            min_gap_seconds=group.min_gap_seconds,
+        )
+        for index, group in enumerate(req.exclusive_groups, start=1)
+    ]
+    result = joint_trial_schedule(payloads, matrix, windows, capacities, groups)
+    locked_runways = _runways_with_locked_input(req)
+    locked_flights = _locked_flights_by_runway(payloads)
+    return (
+        payloads,
+        matrix,
+        windows,
+        capacities,
+        groups,
+        result,
+        locked_runways,
+        locked_flights,
+    )
 
 
 def nested_matrix(matrix: dict[tuple[str, str], int]) -> dict[str, dict[str, int]]:

@@ -12,7 +12,9 @@ from .separation import (
     CapacityViolation,
     ClosureConflict,
     ClosureWindow,
+    ExclusiveGroup,
     Flight,
+    JointTrialResult,
     SwapRunwayResult,
     TrialRunwayResult,
     Violation,
@@ -49,6 +51,8 @@ def save_batch(
     trial_by_runway: dict[str, TrialRunwayResult] | None = None,
     swap_by_runway: dict[str, SwapRunwayResult] | None = None,
     locked_runways: set[str] | None = None,
+    exclusive_groups: list[ExclusiveGroup] | None = None,
+    joint_trial: JointTrialResult | None = None,
 ) -> str:
     batch_id = new_batch_id()
     created_at = datetime.now(timezone.utc).isoformat()
@@ -262,6 +266,130 @@ def save_batch(
             ),
         )
 
+    for group in exclusive_groups or []:
+        for runway in sorted(group.runways):
+            conn.execute(
+                "INSERT INTO exclusive_groups (batch_id, group_index, runway,"
+                " min_gap_seconds) VALUES (?, ?, ?, ?)",
+                (batch_id, group.index, runway, group.min_gap_seconds),
+            )
+
+    if joint_trial is not None:
+        for item in joint_trial.items:
+            conn.execute(
+                "INSERT INTO joint_trial_items (batch_id, position, flight_no, wake,"
+                " runway, scheduled_off, adjusted_off, delay_seconds, constraint_type,"
+                " triggered_by, closure_hit, closure_window_start, closure_window_end,"
+                " locked, capacity_hit, capacity_window_seconds,"
+                " capacity_max_departures, capacity_anchor, capacity_window_start,"
+                " capacity_window_end, group_hit, group_index, group_min_gap_seconds,"
+                " group_triggered_by, group_triggered_runway, group_triggered_off,"
+                " group_required_off, group_window_start, group_window_end)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                " ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    item.position,
+                    item.flight_no,
+                    item.wake,
+                    item.runway,
+                    _iso(item.original_time),
+                    _iso(item.adjusted_time),
+                    item.delay_seconds,
+                    item.constraint,
+                    item.triggered_by,
+                    int(item.closure_hit),
+                    _iso(item.closure_window.start) if item.closure_window else None,
+                    _iso(item.closure_window.end) if item.closure_window else None,
+                    int(item.locked),
+                    int(item.capacity_hit),
+                    item.capacity_window_seconds,
+                    item.capacity_max_departures,
+                    item.capacity_anchor,
+                    _iso(item.capacity_window_start)
+                    if item.capacity_window_start
+                    else None,
+                    _iso(item.capacity_window_end) if item.capacity_window_end else None,
+                    int(item.group_hit),
+                    item.group_index,
+                    item.group_min_gap_seconds,
+                    item.group_triggered_by,
+                    item.group_triggered_runway,
+                    _iso(item.group_triggered_off) if item.group_triggered_off else None,
+                    _iso(item.group_required_off) if item.group_required_off else None,
+                    _iso(item.group_window_start) if item.group_window_start else None,
+                    _iso(item.group_window_end) if item.group_window_end else None,
+                ),
+            )
+        blocked = joint_trial.blocked
+        if blocked is not None:
+            conn.execute(
+                "INSERT INTO joint_trial_blockers (batch_id, position, flight_no,"
+                " wake, runway, scheduled_off, constraint_type, required_earliest_off,"
+                " wake_required_off, closure_required_off, capacity_required_off,"
+                " group_required_off, triggered_by, required_gap_seconds, closure_hit,"
+                " closure_window_start, closure_window_end, capacity_hit,"
+                " capacity_window_seconds, capacity_max_departures, capacity_anchor,"
+                " capacity_window_start, capacity_window_end, group_hit, group_index,"
+                " group_min_gap_seconds, group_triggered_by, group_triggered_runway,"
+                " group_triggered_off, group_window_start, group_window_end)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                " ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    blocked.position,
+                    blocked.flight_no,
+                    blocked.wake,
+                    blocked.runway,
+                    _iso(blocked.scheduled_off),
+                    blocked.constraint,
+                    _iso(blocked.required_earliest_off),
+                    _iso(blocked.wake_required_off)
+                    if blocked.wake_required_off
+                    else None,
+                    _iso(blocked.closure_required_off)
+                    if blocked.closure_required_off
+                    else None,
+                    _iso(blocked.capacity_required_off)
+                    if blocked.capacity_required_off
+                    else None,
+                    _iso(blocked.group_required_off)
+                    if blocked.group_required_off
+                    else None,
+                    blocked.triggered_by,
+                    blocked.required_gap_seconds,
+                    int(blocked.closure_hit),
+                    _iso(blocked.closure_window.start)
+                    if blocked.closure_window
+                    else None,
+                    _iso(blocked.closure_window.end) if blocked.closure_window else None,
+                    int(blocked.capacity_hit),
+                    blocked.capacity_window_seconds,
+                    blocked.capacity_max_departures,
+                    blocked.capacity_anchor,
+                    _iso(blocked.capacity_window_start)
+                    if blocked.capacity_window_start
+                    else None,
+                    _iso(blocked.capacity_window_end)
+                    if blocked.capacity_window_end
+                    else None,
+                    int(blocked.group_hit),
+                    blocked.group_index,
+                    blocked.group_min_gap_seconds,
+                    blocked.group_triggered_by,
+                    blocked.group_triggered_runway,
+                    _iso(blocked.group_triggered_off)
+                    if blocked.group_triggered_off
+                    else None,
+                    _iso(blocked.group_window_start)
+                    if blocked.group_window_start
+                    else None,
+                    _iso(blocked.group_window_end)
+                    if blocked.group_window_end
+                    else None,
+                ),
+            )
+
     return batch_id
 
 
@@ -431,6 +559,204 @@ def load_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
             result["total_capacity_violations"] = sum(
                 len(v) for v in cap_violations_by_runway.values()
             )
+        if batch_has_locks:
+            result["total_locked"] = sum(len(v) for v in locked_by_runway.values())
+        return result
+
+    if row["mode"] == "joint_trial":
+        grows = conn.execute(
+            "SELECT group_index, runway, min_gap_seconds FROM exclusive_groups"
+            " WHERE batch_id = ? ORDER BY group_index, runway",
+            (batch_id,),
+        ).fetchall()
+        groups_by_index: dict[int, dict] = {}
+        for gr in grows:
+            entry = groups_by_index.setdefault(
+                gr["group_index"],
+                {
+                    "index": gr["group_index"],
+                    "runways": [],
+                    "min_gap_seconds": gr["min_gap_seconds"],
+                },
+            )
+            entry["runways"].append(gr["runway"])
+        exclusive_groups = [groups_by_index[i] for i in sorted(groups_by_index)]
+
+        jrows = conn.execute(
+            "SELECT * FROM joint_trial_items WHERE batch_id = ? ORDER BY position",
+            (batch_id,),
+        ).fetchall()
+        joint_items: list[dict] = []
+        for jr in jrows:
+            closure_window = None
+            if jr["closure_window_start"] is not None:
+                closure_window = {
+                    "start": _dt(jr["closure_window_start"]),
+                    "end": _dt(jr["closure_window_end"]),
+                }
+            group_window = None
+            if jr["group_window_start"] is not None:
+                group_window = {
+                    "start": _dt(jr["group_window_start"]),
+                    "end": _dt(jr["group_window_end"]),
+                }
+            item = {
+                "position": jr["position"],
+                "flight_no": jr["flight_no"],
+                "wake": jr["wake"],
+                "runway": jr["runway"],
+                "scheduled_off": _dt(jr["scheduled_off"]),
+                "adjusted_off": _dt(jr["adjusted_off"]),
+                "delay_seconds": jr["delay_seconds"],
+                "constraint": jr["constraint_type"],
+                "triggered_by": jr["triggered_by"],
+                "closure_hit": bool(jr["closure_hit"]),
+                "closure_window": closure_window,
+                "group_hit": bool(jr["group_hit"]),
+                "group_index": jr["group_index"],
+                "group_min_gap_seconds": jr["group_min_gap_seconds"],
+                "group_triggered_by": jr["group_triggered_by"],
+                "group_triggered_runway": jr["group_triggered_runway"],
+                "group_triggered_off": (
+                    _dt(jr["group_triggered_off"])
+                    if jr["group_triggered_off"] is not None
+                    else None
+                ),
+                "group_required_off": (
+                    _dt(jr["group_required_off"])
+                    if jr["group_required_off"] is not None
+                    else None
+                ),
+                "group_window": group_window,
+            }
+            if jr["runway"] in capacities_by_runway:
+                capacity_window = None
+                if jr["capacity_window_start"] is not None:
+                    capacity_window = {
+                        "start": _dt(jr["capacity_window_start"]),
+                        "end": _dt(jr["capacity_window_end"]),
+                    }
+                item["capacity_hit"] = bool(jr["capacity_hit"])
+                item["capacity_window_seconds"] = jr["capacity_window_seconds"]
+                item["capacity_max_departures"] = jr["capacity_max_departures"]
+                item["capacity_anchor"] = jr["capacity_anchor"]
+                item["capacity_window"] = capacity_window
+            if jr["runway"] in locked_by_runway:
+                item["locked"] = bool(jr["locked"])
+            joint_items.append(item)
+
+        blocked = None
+        br = conn.execute(
+            "SELECT * FROM joint_trial_blockers WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if br is not None:
+            closure_window = None
+            if br["closure_window_start"] is not None:
+                closure_window = {
+                    "start": _dt(br["closure_window_start"]),
+                    "end": _dt(br["closure_window_end"]),
+                }
+            group_window = None
+            if br["group_window_start"] is not None:
+                group_window = {
+                    "start": _dt(br["group_window_start"]),
+                    "end": _dt(br["group_window_end"]),
+                }
+            blocked = {
+                "flight_no": br["flight_no"],
+                "wake": br["wake"],
+                "runway": br["runway"],
+                "scheduled_off": _dt(br["scheduled_off"]),
+                "position": br["position"],
+                "constraint": br["constraint_type"],
+                "required_earliest_off": _dt(br["required_earliest_off"]),
+                "wake_required_off": (
+                    _dt(br["wake_required_off"])
+                    if br["wake_required_off"] is not None
+                    else None
+                ),
+                "closure_required_off": (
+                    _dt(br["closure_required_off"])
+                    if br["closure_required_off"] is not None
+                    else None
+                ),
+                "capacity_required_off": (
+                    _dt(br["capacity_required_off"])
+                    if br["capacity_required_off"] is not None
+                    else None
+                ),
+                "group_required_off": (
+                    _dt(br["group_required_off"])
+                    if br["group_required_off"] is not None
+                    else None
+                ),
+                "triggered_by": br["triggered_by"],
+                "required_gap_seconds": br["required_gap_seconds"],
+                "closure_hit": bool(br["closure_hit"]),
+                "closure_window": closure_window,
+                "group_hit": bool(br["group_hit"]),
+                "group_index": br["group_index"],
+                "group_min_gap_seconds": br["group_min_gap_seconds"],
+                "group_triggered_by": br["group_triggered_by"],
+                "group_triggered_runway": br["group_triggered_runway"],
+                "group_triggered_off": (
+                    _dt(br["group_triggered_off"])
+                    if br["group_triggered_off"] is not None
+                    else None
+                ),
+                "group_window": group_window,
+            }
+            if br["runway"] in capacities_by_runway:
+                capacity_window = None
+                if br["capacity_window_start"] is not None:
+                    capacity_window = {
+                        "start": _dt(br["capacity_window_start"]),
+                        "end": _dt(br["capacity_window_end"]),
+                    }
+                blocked["capacity_hit"] = bool(br["capacity_hit"])
+                blocked["capacity_window_seconds"] = br["capacity_window_seconds"]
+                blocked["capacity_max_departures"] = br["capacity_max_departures"]
+                blocked["capacity_anchor"] = br["capacity_anchor"]
+                blocked["capacity_window"] = capacity_window
+
+        # global stable order over every stored flight
+        global_order = [
+            fr["flight_no"]
+            for fr in sorted(
+                flight_rows, key=lambda fr: (_dt(fr["scheduled_off"]), fr["flight_no"])
+            )
+        ]
+        runways = []
+        for runway in order_by_runway:
+            report = {
+                "runway": runway,
+                "order": order_by_runway[runway],
+                "total": len(order_by_runway[runway]),
+                "closures": closures_by_runway.get(runway, []),
+            }
+            if runway in capacities_by_runway:
+                report["capacity"] = capacities_by_runway[runway]
+            if runway in locked_by_runway:
+                report["locked_flights"] = locked_by_runway[runway]
+            runways.append(report)
+        result = {
+            "batch_id": row["batch_id"],
+            "mode": "joint_trial",
+            "created_at": row["created_at"],
+            "matrix": matrix,
+            "total_runways": len(runways),
+            "total_flights": sum(len(o) for o in order_by_runway.values()),
+            "total_delayed": sum(1 for i in joint_items if i["delay_seconds"] > 0),
+            "total_delay_seconds": sum(i["delay_seconds"] for i in joint_items),
+            "max_delay_seconds": max(
+                (i["delay_seconds"] for i in joint_items), default=0
+            ),
+            "order": global_order,
+            "exclusive_groups": exclusive_groups,
+            "items": joint_items,
+            "blocked": blocked,
+            "runways": runways,
+        }
         if batch_has_locks:
             result["total_locked"] = sum(len(v) for v in locked_by_runway.values())
         return result

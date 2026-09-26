@@ -10,6 +10,7 @@ from app.separation import (
     DEFAULT_MATRIX,
     Capacity,
     ClosureWindow,
+    ExclusiveGroup,
     Flight,
     best_adjacent_swap,
     build_matrix,
@@ -17,6 +18,7 @@ from app.separation import (
     find_capacity_violations,
     find_closure_conflicts,
     find_violations,
+    joint_trial_schedule,
     required_gap,
     sort_flights,
     sort_windows,
@@ -606,3 +608,296 @@ def test_best_adjacent_swap_respects_closures_and_capacity():
     assert result.optimized.items[1].adjusted_time == dt(200)
     assert result.optimized.items[1].closure_hit is True
     assert result.saved_seconds == 0
+
+
+# ---------- joint trial (mutually exclusive runway groups) ----------
+
+
+def group(index: int, runways: list[str], gap: int) -> ExclusiveGroup:
+    return ExclusiveGroup(
+        index=index, runways=frozenset(runways), min_gap_seconds=gap
+    )
+
+
+def test_joint_global_stable_order_merges_runways():
+    # flights of every runway are merged into one (time, flight_no) order;
+    # positions refer to that global order, wake applies only per runway
+    flights_by_runway = {
+        "36L": [make("CA2", 50, "M"), make("CA1", 0, "J")],
+        "18R": [make("MU2", 400, "M"), make("MU1", 50, "M")],  # tie with CA2
+    }
+    result = joint_trial_schedule(
+        flights_by_runway, build_matrix(None), {}, {}, []
+    )
+    # CA2 sorts before MU1 on the flight_no tiebreak at t=50
+    assert [i.flight_no for i in result.items] == ["CA1", "CA2", "MU1", "MU2"]
+    assert [i.position for i in result.items] == [1, 2, 3, 4]
+    assert [i.runway for i in result.items] == ["36L", "36L", "18R", "18R"]
+    by_no = {i.flight_no: i for i in result.items}
+    # CA2 wake-pushed behind CA1 (J->M 180); MU1 leads its own runway
+    assert by_no["CA2"].adjusted_time == dt(180)
+    assert by_no["CA2"].triggered_by == "CA1"
+    assert by_no["CA2"].constraint == "wake"
+    assert by_no["MU1"].delay_seconds == 0
+    assert by_no["MU1"].triggered_by is None
+    assert result.feasible and result.blocked is None
+
+
+def test_joint_group_gap_pushes_cross_runway_departure():
+    flights_by_runway = {
+        "36L": [make("CA1", 0, "M")],
+        "18R": [make("MU1", 60, "M")],
+    }
+    result = joint_trial_schedule(
+        flights_by_runway,
+        build_matrix(None),
+        {},
+        {},
+        [group(1, ["36L", "18R"], 90)],
+    )
+    by_no = {i.flight_no: i for i in result.items}
+    mu1 = by_no["MU1"]
+    # 60 < 0 + 90 -> pushed to the end of CA1's occupancy span
+    assert mu1.adjusted_time == dt(90)
+    assert mu1.delay_seconds == 30
+    assert mu1.constraint == "group"
+    assert mu1.group_hit is True
+    assert mu1.group_index == 1
+    assert mu1.group_min_gap_seconds == 90
+    assert mu1.group_triggered_by == "CA1"
+    assert mu1.group_triggered_runway == "36L"
+    assert mu1.group_triggered_off == dt(0)
+    assert mu1.group_required_off == dt(90)
+    assert mu1.group_window_start == dt(0)
+    assert mu1.group_window_end == dt(90)
+    assert by_no["CA1"].group_hit is False
+
+
+def test_joint_group_gap_span_is_half_open():
+    # exactly min_gap after the other departure is compliant; one second
+    # less is not
+    base = {"36L": [make("CA1", 0, "M")]}
+    ok = joint_trial_schedule(
+        {**base, "18R": [make("MU1", 90, "M")]},
+        build_matrix(None), {}, {}, [group(1, ["36L", "18R"], 90)],
+    )
+    assert ok.items[1].delay_seconds == 0
+    tight = joint_trial_schedule(
+        {**base, "18R": [make("MU1", 89, "M")]},
+        build_matrix(None), {}, {}, [group(1, ["36L", "18R"], 90)],
+    )
+    assert tight.items[1].adjusted_time == dt(90)
+    assert tight.items[1].delay_seconds == 1
+
+
+def test_joint_group_gap_against_later_same_group_departure():
+    # CA2 is wake-pushed to 180; MU1 (scheduled 100) would sit only 80 s
+    # before it -> pushed to 180 + 90, the *later* departure's span end
+    flights_by_runway = {
+        "36L": [make("CA1", 0, "J"), make("CA2", 50, "M")],
+        "18R": [make("MU1", 100, "M")],
+    }
+    result = joint_trial_schedule(
+        flights_by_runway,
+        build_matrix(None),
+        {},
+        {},
+        [group(1, ["36L", "18R"], 90)],
+    )
+    by_no = {i.flight_no: i for i in result.items}
+    assert by_no["CA2"].adjusted_time == dt(180)
+    mu1 = by_no["MU1"]
+    assert mu1.adjusted_time == dt(270)
+    assert mu1.group_triggered_by == "CA2"
+    assert mu1.group_triggered_off == dt(180)
+    assert mu1.group_window_end == dt(270)
+
+
+def test_joint_group_gap_applies_within_same_runway_too():
+    # two departures on one member runway are also "two departures in the
+    # group": with a zero wake matrix the group gap still separates them
+    flights_by_runway = {
+        "36L": [make("CA1", 0, "M"), make("CA2", 100, "M")],
+        "18R": [make("MU1", 500, "M")],
+    }
+    matrix = build_matrix({("M", "M"): 0})
+    result = joint_trial_schedule(
+        flights_by_runway, matrix, {}, {}, [group(1, ["36L", "18R"], 120)]
+    )
+    by_no = {i.flight_no: i for i in result.items}
+    assert by_no["CA2"].adjusted_time == dt(120)
+    assert by_no["CA2"].group_triggered_by == "CA1"
+    assert by_no["CA2"].group_triggered_runway == "36L"
+
+
+def test_joint_group_push_into_closure_iterates_until_converged():
+    # group push lands MU1 on 90, inside its own runway's [90, 200) closure;
+    # the closure then pushes it to 200 and every constraint is re-checked
+    flights_by_runway = {
+        "36L": [make("CA1", 0, "M")],
+        "18R": [make("MU1", 30, "M")],
+    }
+    result = joint_trial_schedule(
+        flights_by_runway,
+        build_matrix(None),
+        {"18R": [window(90, 200)]},
+        {},
+        [group(1, ["36L", "18R"], 90)],
+    )
+    mu1 = result.items[1]
+    assert mu1.adjusted_time == dt(200)
+    assert mu1.group_hit is True
+    assert mu1.closure_hit is True
+    assert mu1.closure_window == window(90, 200)
+    # closure outranks group when naming the first pushing constraint
+    assert mu1.constraint == "closure"
+
+
+def test_joint_capacity_push_into_group_span_iterates():
+    # CA3 is capacity-pushed from 150 to 180 (anchor CA1 + 180 s), but 180 is
+    # only 60 s ahead of MU1's adjusted 120; the group constraint then pushes
+    # it to 210 and capacity is re-checked against the new candidate.
+    flights_by_runway = {
+        "36L": [make("CA1", 0, "M"), make("CA3", 150, "M")],
+        "18R": [make("MU1", 120, "M")],
+    }
+    matrix = build_matrix({("M", "M"): 0})
+    result = joint_trial_schedule(
+        flights_by_runway,
+        matrix,
+        {},
+        {"36L": Capacity(180, 1)},
+        [group(1, ["36L", "18R"], 90)],
+    )
+    by_no = {i.flight_no: i for i in result.items}
+    # MU1 stays: 120 is exactly 120 s after CA1, outside the 90 s band
+    assert by_no["MU1"].adjusted_time == dt(120)
+    ca3 = by_no["CA3"]
+    assert ca3.adjusted_time == dt(210)
+    assert ca3.delay_seconds == 60
+    assert ca3.capacity_hit is True
+    assert ca3.capacity_anchor == "CA1"
+    assert ca3.group_hit is True
+    assert ca3.group_triggered_by == "MU1"
+    assert ca3.group_window_end == dt(210)
+    assert ca3.constraint == "capacity"  # capacity outranks group
+
+
+def test_joint_multiple_groups_are_independent():
+    flights_by_runway = {
+        "01": [make("A1", 0, "M")],
+        "02": [make("B1", 30, "M")],
+        "03": [make("C1", 40, "M")],
+        "04": [make("D1", 45, "M")],
+    }
+    matrix = build_matrix({("M", "M"): 0})
+    result = joint_trial_schedule(
+        flights_by_runway,
+        matrix,
+        {},
+        {},
+        [group(1, ["01", "02"], 90), group(2, ["03", "04"], 30)],
+    )
+    by_no = {i.flight_no: i for i in result.items}
+    # B1 pushed by group 1 (A1 + 90); C1/D1 belong to group 2 only
+    assert by_no["B1"].adjusted_time == dt(90)
+    assert by_no["B1"].group_index == 1
+    assert by_no["C1"].delay_seconds == 0
+    assert by_no["D1"].adjusted_time == dt(70)  # C1 + 30
+    assert by_no["D1"].group_index == 2
+
+
+def test_joint_without_groups_matches_independent_trials():
+    flights_by_runway = {
+        "36L": [make("CA1", 0, "J"), make("CA2", 60, "M"), make("CA3", 200, "M")],
+        "18R": [make("MU1", 30, "H"), make("MU2", 100, "L")],
+    }
+    matrix = build_matrix(None)
+    windows = {"36L": [window(150, 210)]}
+    capacities = {"18R": Capacity(50, 1)}
+    result = joint_trial_schedule(
+        flights_by_runway, matrix, windows, capacities, []
+    )
+    for runway, flights in flights_by_runway.items():
+        solo = trial_reschedule(
+            flights, matrix, windows.get(runway), capacities.get(runway)
+        )
+        joint = [i for i in result.items if i.runway == runway]
+        assert [i.flight_no for i in joint] == [i.flight_no for i in solo.items]
+        assert [i.adjusted_time for i in joint] == [
+            i.adjusted_time for i in solo.items
+        ]
+
+
+def test_joint_locked_flight_blocked_by_group_stops_everything():
+    flights_by_runway = {
+        "36L": [make("CA1", 0, "J")],
+        "18R": [make("MU1", 60, "M", locked=True), make("MU2", 500, "M")],
+    }
+    result = joint_trial_schedule(
+        flights_by_runway,
+        build_matrix(None),
+        {},
+        {},
+        [group(1, ["36L", "18R"], 90)],
+    )
+    assert not result.feasible
+    # feasible prefix only: MU2 (later in the global order) gets no proposal
+    assert [i.flight_no for i in result.items] == ["CA1"]
+    blocked = result.blocked
+    assert blocked.flight_no == "MU1"
+    assert blocked.runway == "18R"
+    assert blocked.position == 2
+    assert blocked.constraint == "group"
+    assert blocked.required_earliest_off == dt(90)
+    assert blocked.group_required_off == dt(90)
+    assert blocked.wake_required_off is None
+    assert blocked.closure_required_off is None
+    assert blocked.capacity_required_off is None
+    assert blocked.group_hit is True
+    assert blocked.group_index == 1
+    assert blocked.group_min_gap_seconds == 90
+    assert blocked.group_triggered_by == "CA1"
+    assert blocked.group_triggered_runway == "36L"
+    assert blocked.group_triggered_off == dt(0)
+    assert blocked.group_window_start == dt(0)
+    assert blocked.group_window_end == dt(90)
+
+
+def test_joint_locked_blocker_reports_every_constraint_required_time():
+    # wake pushes the locked CA2 to 180, inside closure [150, 300) -> 300;
+    # the blocker names wake first but reports each constraint's instant
+    flights_by_runway = {
+        "36L": [make("CA1", 0, "J"), make("CA2", 60, "M", locked=True)],
+    }
+    result = joint_trial_schedule(
+        flights_by_runway, build_matrix(None), {"36L": [window(150, 300)]}, {}, []
+    )
+    blocked = result.blocked
+    assert blocked.constraint == "wake"
+    assert blocked.triggered_by == "CA1"
+    assert blocked.required_gap_seconds == 180
+    assert blocked.wake_required_off == dt(180)
+    assert blocked.closure_required_off == dt(300)
+    assert blocked.required_earliest_off == dt(300)
+    assert blocked.closure_hit is True
+    assert blocked.closure_window == window(150, 300)
+
+
+def test_joint_locked_flight_feasible_keeps_scheduled_off():
+    flights_by_runway = {
+        "36L": [make("CA1", 0, "J")],
+        "18R": [make("MU1", 300, "M", locked=True)],
+    }
+    result = joint_trial_schedule(
+        flights_by_runway,
+        build_matrix(None),
+        {},
+        {},
+        [group(1, ["36L", "18R"], 90)],
+    )
+    assert result.feasible
+    mu1 = result.items[1]
+    assert mu1.locked is True
+    assert mu1.adjusted_time == dt(300)
+    assert mu1.delay_seconds == 0
